@@ -1,0 +1,525 @@
+dsl_version: 3
+name: cloudtrail
+version: 0.1.0
+backend: http
+description: >-
+  Query AWS CloudTrail management events via LookupEvents. Captures every AWS
+  API call that creates, modifies, or deletes a resource — regardless of
+  whether CloudFormation, Terraform, CDK, GitHub Actions, or manual CLI/console
+  was used. Useful for correlating infrastructure changes with code commits
+  and cost spikes.
+inputs:
+  AWS_REGION:
+    kind: variable
+    default: us-east-1
+    hint: |
+      AWS region for CloudTrail API requests. CloudTrail is regional — each
+      region maintains its own independent event history. Query the region
+      where your resources are deployed. To cover multiple regions, add this
+      source once per region with a different AWS_REGION value.
+      Common values: us-east-1, us-west-2, eu-west-1, eu-central-1,
+      ap-southeast-1, ap-northeast-1.
+  AWS_ENDPOINT_SUFFIX:
+    kind: variable
+    default: amazonaws.com
+    hint: |
+      AWS endpoint DNS suffix. Keep 'amazonaws.com' for standard AWS regions.
+      Use the appropriate suffix for GovCloud or China regions.
+  AWS_ACCESS_KEY_ID:
+    kind: secret
+    hint: |
+      AWS access key ID with cloudtrail:LookupEvents read permission.
+      This is a read-only permission that does not grant access to log content
+      stored in S3 — only the 90-day management event history.
+  AWS_SECRET_ACCESS_KEY:
+    kind: secret
+    hint: |
+      AWS secret access key paired with AWS_ACCESS_KEY_ID.
+      Coral does not read your AWS CLI profile or AWS_PROFILE at query time.
+base_url: https://cloudtrail.{{input.AWS_REGION}}.{{input.AWS_ENDPOINT_SUFFIX}}
+auth:
+  type: CustomAuth
+  authenticator: aws_sigv4
+  service: cloudtrail
+  region: "{{input.AWS_REGION}}"
+  access_key_id: "{{input.AWS_ACCESS_KEY_ID}}"
+  secret_access_key: "{{input.AWS_SECRET_ACCESS_KEY}}"
+request_headers:
+  - name: Content-Type
+    from: literal
+    value: application/x-amz-json-1.1
+  - name: X-Amz-Target
+    from: literal
+    value: com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents
+test_queries:
+  - >-
+    SELECT event_name, username, event_time
+    FROM cloudtrail.management_events
+    WHERE start_time = 1746057600
+    AND end_time = 1748736000
+    LIMIT 5
+  - >-
+    SELECT event_name, resource_name, event_time
+    FROM cloudtrail.lambda_events
+    WHERE start_time = 1746057600
+    AND end_time = 1748736000
+    LIMIT 5
+tables:
+  - name: management_events
+    description: >-
+      All write-only AWS management events returned by LookupEvents.
+      Covers resource creation, modification, and deletion across all AWS
+      services. Use this as a universal deployment record when the specific
+      service is unknown.
+    guide: |
+      Requires start_time and end_time as Unix epoch seconds (Int64).
+      LookupEvents retains 90 days of management event history.
+      Rate limit: 1 request per second. ReadOnly is set to false so only
+      mutating calls are returned (creates, updates, deletes), not describe/list.
+      The cloudtrail_event column contains the full event JSON string;
+      use json_get_str(cloudtrail_event, 'requestParameters') to inspect
+      what changed.
+    filters:
+      - name: start_time
+        required: true
+        description: Event window start as Unix epoch seconds, e.g. 1715644800.
+      - name: end_time
+        required: true
+        description: Event window end as Unix epoch seconds, e.g. 1715731200.
+    request:
+      method: POST
+      path: /
+      body:
+        - path: [LookupAttributes, "0", AttributeKey]
+          from: literal
+          value: ReadOnly
+        - path: [LookupAttributes, "0", AttributeValue]
+          from: literal
+          value: "false"
+        - path: [StartTime]
+          from: filter_int
+          key: start_time
+        - path: [EndTime]
+          from: filter_int
+          key: end_time
+        - path: [MaxResults]
+          from: literal
+          value: 50
+    response:
+      rows_path: [Events]
+    pagination:
+      mode: cursor_body
+      cursor_body_path: [NextToken]
+      response_cursor_path: [NextToken]
+      max_pages: 100
+    columns:
+      - name: start_time
+        type: Int64
+        nullable: false
+        virtual: true
+        description: Start time filter (Unix epoch seconds).
+        expr: {kind: from_filter, key: start_time}
+      - name: end_time
+        type: Int64
+        nullable: false
+        virtual: true
+        description: End time filter (Unix epoch seconds).
+        expr: {kind: from_filter, key: end_time}
+      - name: event_id
+        type: Utf8
+        nullable: true
+        description: Unique CloudTrail event ID.
+        expr: {kind: path, path: [EventId]}
+      - name: event_name
+        type: Utf8
+        nullable: true
+        description: >-
+          AWS API operation name, e.g. 'UpdateFunctionConfiguration',
+          'UpdateStack', 'RunInstances'.
+        expr: {kind: path, path: [EventName]}
+      - name: event_time
+        type: Timestamp
+        nullable: true
+        description: When the API call was made (UTC).
+        expr:
+          kind: format_timestamp
+          input: seconds
+          expr: {kind: path, path: [EventTime]}
+      - name: event_source
+        type: Utf8
+        nullable: true
+        description: >-
+          AWS service that received the call, e.g. 'lambda.amazonaws.com',
+          'cloudformation.amazonaws.com', 'ec2.amazonaws.com'.
+        expr: {kind: path, path: [EventSource]}
+      - name: username
+        type: Utf8
+        nullable: true
+        description: >-
+          IAM entity that made the call — an IAM username, a role name such as
+          'github-actions-deploy', or 'root'. Use to distinguish CI/CD automated
+          changes from manual console changes.
+        expr: {kind: path, path: [Username]}
+      - name: access_key_id
+        type: Utf8
+        nullable: true
+        description: Access key ID used for the call.
+        expr: {kind: path, path: [AccessKeyId]}
+      - name: resource_type
+        type: Utf8
+        nullable: true
+        description: >-
+          CloudFormation resource type of the primary resource, e.g.
+          'AWS::Lambda::Function'. Extracted from the first Resources entry.
+        expr: {kind: path, path: [Resources, "0", ResourceType]}
+      - name: resource_name
+        type: Utf8
+        nullable: true
+        description: >-
+          Name or ARN of the primary affected resource. For Lambda this is
+          the function name; for CloudFormation stacks this is the stack name.
+        expr: {kind: path, path: [Resources, "0", ResourceName]}
+      - name: cloudtrail_event
+        type: Json
+        nullable: true
+        description: >-
+          Full CloudTrail event as a JSON string. Use json_get_str to extract
+          nested fields such as requestParameters or responseElements.
+          Example: json_get_str(cloudtrail_event, 'requestParameters').
+        expr: {kind: path, path: [CloudTrailEvent]}
+
+  - name: lambda_events
+    description: >-
+      Lambda function write events returned by LookupEvents, scoped to
+      'lambda.amazonaws.com'. Captures UpdateFunctionConfiguration,
+      UpdateFunctionCode, CreateFunction, and DeleteFunction calls regardless
+      of how they were triggered — CloudFormation, Terraform, GitHub Actions,
+      or manual CLI.
+    guide: |
+      Requires start_time and end_time as Unix epoch seconds.
+      Use resource_name to identify which Lambda function changed.
+      Use username to distinguish CI/CD role names from human users.
+      To see what changed (e.g. new memory size), inspect cloudtrail_event:
+      json_get_str(cloudtrail_event, 'requestParameters').
+    filters:
+      - name: start_time
+        required: true
+        description: Event window start as Unix epoch seconds.
+      - name: end_time
+        required: true
+        description: Event window end as Unix epoch seconds.
+    request:
+      method: POST
+      path: /
+      body:
+        - path: [LookupAttributes, "0", AttributeKey]
+          from: literal
+          value: EventSource
+        - path: [LookupAttributes, "0", AttributeValue]
+          from: literal
+          value: lambda.amazonaws.com
+        - path: [StartTime]
+          from: filter_int
+          key: start_time
+        - path: [EndTime]
+          from: filter_int
+          key: end_time
+        - path: [MaxResults]
+          from: literal
+          value: 50
+    response:
+      rows_path: [Events]
+    pagination:
+      mode: cursor_body
+      cursor_body_path: [NextToken]
+      response_cursor_path: [NextToken]
+      max_pages: 100
+    columns:
+      - name: start_time
+        type: Int64
+        nullable: false
+        virtual: true
+        description: Start time filter (Unix epoch seconds).
+        expr: {kind: from_filter, key: start_time}
+      - name: end_time
+        type: Int64
+        nullable: false
+        virtual: true
+        description: End time filter (Unix epoch seconds).
+        expr: {kind: from_filter, key: end_time}
+      - name: event_id
+        type: Utf8
+        nullable: true
+        description: Unique CloudTrail event ID.
+        expr: {kind: path, path: [EventId]}
+      - name: event_name
+        type: Utf8
+        nullable: true
+        description: >-
+          Lambda API operation name, e.g. 'UpdateFunctionConfiguration',
+          'UpdateFunctionCode', 'CreateFunction', 'DeleteFunction'.
+        expr: {kind: path, path: [EventName]}
+      - name: event_time
+        type: Timestamp
+        nullable: true
+        description: When the Lambda API call was made (UTC).
+        expr:
+          kind: format_timestamp
+          input: seconds
+          expr: {kind: path, path: [EventTime]}
+      - name: username
+        type: Utf8
+        nullable: true
+        description: IAM entity that made the call. Role names reveal CI/CD pipeline names.
+        expr: {kind: path, path: [Username]}
+      - name: access_key_id
+        type: Utf8
+        nullable: true
+        description: Access key ID used for the call.
+        expr: {kind: path, path: [AccessKeyId]}
+      - name: resource_name
+        type: Utf8
+        nullable: true
+        description: Lambda function name or ARN.
+        expr: {kind: path, path: [Resources, "0", ResourceName]}
+      - name: cloudtrail_event
+        type: Json
+        nullable: true
+        description: >-
+          Full CloudTrail event JSON. Use json_get_str(cloudtrail_event,
+          'requestParameters') to see what configuration changed — for
+          UpdateFunctionConfiguration this includes memorySize, timeout,
+          and environment variables.
+        expr: {kind: path, path: [CloudTrailEvent]}
+
+  - name: cloudformation_events
+    description: >-
+      CloudFormation stack operation events returned by LookupEvents, scoped
+      to 'cloudformation.amazonaws.com'. Captures CreateStack, UpdateStack,
+      DeleteStack, and ExecuteChangeSet calls. Use this to correlate stack
+      deployments with GitHub PR merge times.
+    guide: |
+      Requires start_time and end_time as Unix epoch seconds.
+      resource_name is the CloudFormation stack name — join this to
+      aws_cost_explorer.cost_by_tag with tag_key = 'aws:cloudformation:stack-name'
+      to attribute costs to the deploying PR.
+      The cloudtrail_event column may contain ClientRequestToken set by CI/CD
+      pipelines — check this before using the time-window join approach.
+      event_name = 'UpdateStack' or 'ExecuteChangeSet' signals a deployment.
+    filters:
+      - name: start_time
+        required: true
+        description: Event window start as Unix epoch seconds.
+      - name: end_time
+        required: true
+        description: Event window end as Unix epoch seconds.
+    request:
+      method: POST
+      path: /
+      body:
+        - path: [LookupAttributes, "0", AttributeKey]
+          from: literal
+          value: EventSource
+        - path: [LookupAttributes, "0", AttributeValue]
+          from: literal
+          value: cloudformation.amazonaws.com
+        - path: [StartTime]
+          from: filter_int
+          key: start_time
+        - path: [EndTime]
+          from: filter_int
+          key: end_time
+        - path: [MaxResults]
+          from: literal
+          value: 50
+    response:
+      rows_path: [Events]
+    pagination:
+      mode: cursor_body
+      cursor_body_path: [NextToken]
+      response_cursor_path: [NextToken]
+      max_pages: 100
+    columns:
+      - name: start_time
+        type: Int64
+        nullable: false
+        virtual: true
+        description: Start time filter (Unix epoch seconds).
+        expr: {kind: from_filter, key: start_time}
+      - name: end_time
+        type: Int64
+        nullable: false
+        virtual: true
+        description: End time filter (Unix epoch seconds).
+        expr: {kind: from_filter, key: end_time}
+      - name: event_id
+        type: Utf8
+        nullable: true
+        description: Unique CloudTrail event ID.
+        expr: {kind: path, path: [EventId]}
+      - name: event_name
+        type: Utf8
+        nullable: true
+        description: >-
+          CloudFormation API operation, e.g. 'UpdateStack', 'CreateStack',
+          'ExecuteChangeSet', 'DeleteStack'.
+        expr: {kind: path, path: [EventName]}
+      - name: event_time
+        type: Timestamp
+        nullable: true
+        description: When the CloudFormation operation was initiated (UTC).
+        expr:
+          kind: format_timestamp
+          input: seconds
+          expr: {kind: path, path: [EventTime]}
+      - name: username
+        type: Utf8
+        nullable: true
+        description: >-
+          IAM entity that triggered the operation. For GitHub Actions this is
+          the assumed role name, e.g. 'github-actions-deploy-prod'.
+        expr: {kind: path, path: [Username]}
+      - name: access_key_id
+        type: Utf8
+        nullable: true
+        description: Access key ID used for the operation.
+        expr: {kind: path, path: [AccessKeyId]}
+      - name: resource_name
+        type: Utf8
+        nullable: true
+        description: >-
+          CloudFormation stack name. Join this to
+          aws_cost_explorer.cost_by_tag WHERE tag_key = 'aws:cloudformation:stack-name'
+          to get the monthly cost of the deployed stack.
+        expr: {kind: path, path: [Resources, "0", ResourceName]}
+      - name: cloudtrail_event
+        type: Json
+        nullable: true
+        description: >-
+          Full CloudTrail event JSON. Inspect json_get_str(cloudtrail_event,
+          'requestParameters.clientRequestToken') — CI/CD pipelines that set
+          this to the commit SHA or PR number give you an exact foreign key to
+          GitHub without needing a time-window join.
+        expr: {kind: path, path: [CloudTrailEvent]}
+
+  - name: ec2_events
+    description: >-
+      EC2 instance and resource write events returned by LookupEvents, scoped
+      to 'ec2.amazonaws.com'. Captures RunInstances, TerminateInstances,
+      ModifyInstanceAttribute, StartInstances, StopInstances, and storage
+      changes regardless of how they were triggered.
+    guide: |
+      Requires start_time and end_time as Unix epoch seconds.
+      resource_name is the EC2 instance ID or resource ARN.
+      Use event_name to filter to specific operations — RunInstances for new
+      instances, ModifyInstanceAttribute for type changes, TerminateInstances
+      for deletions.
+      Combine with aws_cost_explorer.cost_by_service to correlate EC2 cost
+      changes with instance lifecycle events:
+        SELECT ec.event_name, ec.resource_name, ec.event_time, ec.username
+        FROM aws_cloudtrail.ec2_events ec
+        WHERE ec.start_time = ...
+          AND ec.event_name IN ('RunInstances', 'ModifyInstanceAttribute')
+      Note: EC2 data events (object-level S3, DynamoDB reads/writes) are NOT
+      captured here — only management events such as instance launches and
+      configuration changes are in the 90-day LookupEvents history.
+    filters:
+      - name: start_time
+        required: true
+        description: Event window start as Unix epoch seconds.
+      - name: end_time
+        required: true
+        description: Event window end as Unix epoch seconds.
+    request:
+      method: POST
+      path: /
+      body:
+        - path: [LookupAttributes, "0", AttributeKey]
+          from: literal
+          value: EventSource
+        - path: [LookupAttributes, "0", AttributeValue]
+          from: literal
+          value: ec2.amazonaws.com
+        - path: [StartTime]
+          from: filter_int
+          key: start_time
+        - path: [EndTime]
+          from: filter_int
+          key: end_time
+        - path: [MaxResults]
+          from: literal
+          value: 50
+    response:
+      rows_path: [Events]
+    pagination:
+      mode: cursor_body
+      cursor_body_path: [NextToken]
+      response_cursor_path: [NextToken]
+      max_pages: 100
+    columns:
+      - name: start_time
+        type: Int64
+        nullable: false
+        virtual: true
+        description: Start time filter (Unix epoch seconds).
+        expr: {kind: from_filter, key: start_time}
+      - name: end_time
+        type: Int64
+        nullable: false
+        virtual: true
+        description: End time filter (Unix epoch seconds).
+        expr: {kind: from_filter, key: end_time}
+      - name: event_id
+        type: Utf8
+        nullable: true
+        description: Unique CloudTrail event ID.
+        expr: {kind: path, path: [EventId]}
+      - name: event_name
+        type: Utf8
+        nullable: true
+        description: >-
+          EC2 API operation name, e.g. 'RunInstances', 'TerminateInstances',
+          'ModifyInstanceAttribute', 'StartInstances', 'StopInstances'.
+        expr: {kind: path, path: [EventName]}
+      - name: event_time
+        type: Timestamp
+        nullable: true
+        description: When the EC2 API call was made (UTC).
+        expr:
+          kind: format_timestamp
+          input: seconds
+          expr: {kind: path, path: [EventTime]}
+      - name: username
+        type: Utf8
+        nullable: true
+        description: >-
+          IAM entity that made the call. Distinguishes automated deployments
+          from manual console changes.
+        expr: {kind: path, path: [Username]}
+      - name: access_key_id
+        type: Utf8
+        nullable: true
+        description: Access key ID used for the call.
+        expr: {kind: path, path: [AccessKeyId]}
+      - name: resource_name
+        type: Utf8
+        nullable: true
+        description: >-
+          EC2 instance ID (e.g. 'i-0abc123') or resource identifier.
+          Use this to correlate with CloudWatch metrics for the same instance.
+        expr: {kind: path, path: [Resources, "0", ResourceName]}
+      - name: resource_type
+        type: Utf8
+        nullable: true
+        description: >-
+          AWS resource type, e.g. 'AWS::EC2::Instance', 'AWS::EC2::Volume',
+          'AWS::EC2::SecurityGroup'.
+        expr: {kind: path, path: [Resources, "0", ResourceType]}
+      - name: cloudtrail_event
+        type: Json
+        nullable: true
+        description: >-
+          Full CloudTrail event JSON. Use json_get_str(cloudtrail_event,
+          'requestParameters') to inspect instance type, AMI, subnet, and
+          other launch parameters for RunInstances events.
+        expr: {kind: path, path: [CloudTrailEvent]}
