@@ -44,18 +44,28 @@ coral source add --file sources/community/cloudtrail/manifest.yaml
 
 ## Tables
 
-| Table | Description | Required filters |
+| Table | Description | Filters |
 |---|---|---|
-| `cloudtrail.management_events` | All write-only management events across all AWS services | `start_time`, `end_time` |
-| `cloudtrail.lambda_events` | Lambda function events (UpdateFunctionConfiguration, UpdateFunctionCode, GetFunction, etc.) — filter by event_name for writes only | `start_time`, `end_time` |
-| `cloudtrail.cloudformation_events` | CloudFormation stack events (UpdateStack, ExecuteChangeSet, DescribeStacks, etc.) — filter by event_name for mutations only | `start_time`, `end_time` |
-| `cloudtrail.ec2_events` | EC2 instance events (RunInstances, ModifyInstanceAttribute, DescribeInstances, etc.) — filter by event_name for mutations only | `start_time`, `end_time` |
+| `cloudtrail.management_events` | All write-only management events across all AWS services | `start_time`, `end_time` (optional, default last 24 hours) |
+| `cloudtrail.lambda_events` | Lambda function events (UpdateFunctionConfiguration, UpdateFunctionCode, GetFunction, etc.) — filter by event_name for writes only | `start_time`, `end_time` (optional, default last 24 hours) |
+| `cloudtrail.cloudformation_events` | CloudFormation stack events (UpdateStack, ExecuteChangeSet, DescribeStacks, etc.) — filter by event_name for mutations only | `start_time`, `end_time` (optional, default last 24 hours) |
+| `cloudtrail.ec2_events` | EC2 instance events (RunInstances, ModifyInstanceAttribute, DescribeInstances, etc.) — filter by event_name for mutations only | `start_time`, `end_time` (optional, default last 24 hours) |
 
-All time filters are **Unix epoch seconds** (Int64).
+All time filters are **Unix epoch seconds** (Int64). When omitted, `start_time` defaults to
+24 hours ago and `end_time` defaults to the current time.
 
 ## Example queries
 
-### Find all infrastructure changes in the last 24 hours
+### Find all infrastructure changes in the last 24 hours (using default window)
+
+```sql
+SELECT event_name, event_source, resource_name, username, event_time
+FROM cloudtrail.management_events
+ORDER BY event_time DESC
+LIMIT 50
+```
+
+### Find all infrastructure changes in a custom time window
 
 ```sql
 SELECT event_name, event_source, resource_name, username, event_time
@@ -86,7 +96,7 @@ SELECT
     ct.username       AS deployed_by,
     g.number          AS pr_number,
     g.title           AS pr_title,
-    g.author_login    AS pr_author,
+    g.user__login     AS pr_author,
     g.merged_at
 FROM cloudtrail.cloudformation_events ct
 JOIN github.pulls g
@@ -135,6 +145,10 @@ ORDER BY event_time DESC
   For older data, query CloudTrail logs in S3 via Athena.
 - **Rate limit:** 2 requests per second per account per region. Queries that paginate
   through many pages may hit this limit.
+- **5,000-event cap:** Pagination is capped at 100 pages × 50 results = 5,000 events per query.
+  For high-traffic accounts or wide time windows this limit can be hit silently — no error is
+  returned, results simply stop at 5,000. Narrow the time window (e.g. query day-by-day) to
+  stay under the cap.
 - **CloudTrail must be enabled:** Most accounts have CloudTrail enabled by
   default. If not, events will be empty rather than returning an error.
 - **`cloudtrail_event` is a JSON column:** Use `json_get_json` to extract nested
@@ -142,5 +156,9 @@ ORDER BY event_time DESC
   The `requestParameters` object shows what values were set. The
   `clientRequestToken` field (when set by CI/CD) can be a direct foreign key to
   the commit or PR that triggered the change: `json_get_str(cloudtrail_event, 'requestParameters', 'clientRequestToken')`.
+- **Empty `resource_name` on some events:** Events like `ConsoleLogin`,
+  `GetSigninToken`, and service-linked role creation do not target a specific
+  resource. For these, the `Resources` array is empty and `resource_name` and
+  `resource_type` will be `null` — this is expected behavior, not a query error.
 - **Region matters:** Each region has its own CloudTrail event history. Query
   the region where your resources are deployed.

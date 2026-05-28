@@ -46,6 +46,9 @@ auth:
   access_key_id: "{{input.AWS_ACCESS_KEY_ID}}"
   secret_access_key: "{{input.AWS_SECRET_ACCESS_KEY}}"
 request_headers:
+  - name: Accept
+    from: literal
+    value: application/json
   - name: Content-Type
     from: literal
     value: application/x-amz-json-1.1
@@ -53,26 +56,19 @@ request_headers:
     from: literal
     value: com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents
 test_queries:
-  - >-
-    SELECT event_name, username, event_time
-    FROM cloudtrail.management_events
-    WHERE start_time = 1779898731
-    AND end_time = 1779985131
-    LIMIT 5
-  - >-
-    SELECT event_name, resource_name, event_time
-    FROM cloudtrail.lambda_events
-    WHERE start_time = 1779898731
-    AND end_time = 1779985131
-    LIMIT 5
+  - SELECT event_name, username, event_time FROM cloudtrail.management_events LIMIT 5
+  - SELECT event_name, resource_name, event_time FROM cloudtrail.lambda_events LIMIT 5
 tables:
   - name: management_events
     description: Write-only AWS management events returned by LookupEvents, covering resource creation, modification, and deletion across all services.
     guide: >
-      Requires start_time and end_time as Unix epoch seconds. LookupEvents
-      retains 90 days of history. ReadOnly is hardcoded to false so only
-      mutating calls are returned. Rate limit is 2 requests per second per
-      account per region. Use json_get_json(cloudtrail_event,
+      start_time and end_time are optional Unix epoch seconds. When omitted,
+      start_time defaults to 24 hours ago and end_time defaults to now.
+      LookupEvents retains 90 days of history. ReadOnly is hardcoded to false
+      so only mutating calls are returned. Rate limit is 2 requests per second
+      per account per region. Queries are capped at 5,000 events (100 pages x
+      50 results); narrow the time window if your account exceeds this in the
+      requested period. Use json_get_json(cloudtrail_event,
       'requestParameters') to inspect what changed.
     request:
       method: POST
@@ -85,8 +81,14 @@ tables:
           from: literal
           value: "false"
         - path: [StartTime]
+          from: now_epoch_minus_seconds
+          seconds: 86400
+        - path: [StartTime]
           from: filter_int
           key: start_time
+        - path: [EndTime]
+          from: now_epoch_minus_seconds
+          seconds: 0
         - path: [EndTime]
           from: filter_int
           key: end_time
@@ -103,15 +105,15 @@ tables:
     columns:
       - name: start_time
         type: Int64
-        nullable: false
+        nullable: true
         virtual: true
-        description: Start time filter (Unix epoch seconds).
+        description: Start time filter (Unix epoch seconds). Defaults to 24 hours ago when omitted.
         expr: {kind: from_filter, key: start_time}
       - name: end_time
         type: Int64
-        nullable: false
+        nullable: true
         virtual: true
-        description: End time filter (Unix epoch seconds).
+        description: End time filter (Unix epoch seconds). Defaults to now when omitted.
         expr: {kind: from_filter, key: end_time}
       - name: event_id
         type: Utf8
@@ -165,23 +167,25 @@ tables:
         expr: {kind: path, path: [CloudTrailEvent]}
     filters:
       - name: start_time
-        required: true
-        description: Event window start as Unix epoch seconds, e.g. 1715644800.
+        description: Event window start as Unix epoch seconds. Defaults to 24 hours ago.
       - name: end_time
-        required: true
-        description: Event window end as Unix epoch seconds, e.g. 1715731200.
+        description: Event window end as Unix epoch seconds. Defaults to now.
 
   - name: lambda_events
     description: Lambda function events returned by LookupEvents, scoped to 'lambda.amazonaws.com'. Includes both read and write operations.
     guide: >
-      Requires start_time and end_time as Unix epoch seconds. Returns all
-      Lambda API calls — including read-only ones such as GetFunction and
-      ListFunctions. The LookupEvents API accepts only one LookupAttribute per
-      request, so ReadOnly=false cannot be combined with the EventSource filter.
-      To restrict to write operations, add WHERE event_name IN
-      ('CreateFunction', 'UpdateFunctionCode', 'UpdateFunctionConfiguration',
-      'DeleteFunction') in your query. Use json_get_json(cloudtrail_event,
-      'requestParameters') to see what configuration changed.
+      start_time and end_time are optional Unix epoch seconds. When omitted,
+      start_time defaults to 24 hours ago and end_time defaults to now.
+      Returns all Lambda API calls — including read-only ones such as
+      GetFunction and ListFunctions. The LookupEvents API accepts only one
+      LookupAttribute per request, so ReadOnly=false cannot be combined with
+      the EventSource filter. To restrict to write operations, add WHERE
+      event_name IN ('CreateFunction', 'UpdateFunctionCode',
+      'UpdateFunctionConfiguration', 'DeleteFunction') in your query. Queries
+      are capped at 5,000 events (100 pages x 50 results); narrow the time
+      window if your account exceeds this in the requested period. Use
+      json_get_json(cloudtrail_event, 'requestParameters') to see what
+      configuration changed.
     request:
       method: POST
       path: /
@@ -193,8 +197,14 @@ tables:
           from: literal
           value: lambda.amazonaws.com
         - path: [StartTime]
+          from: now_epoch_minus_seconds
+          seconds: 86400
+        - path: [StartTime]
           from: filter_int
           key: start_time
+        - path: [EndTime]
+          from: now_epoch_minus_seconds
+          seconds: 0
         - path: [EndTime]
           from: filter_int
           key: end_time
@@ -211,15 +221,15 @@ tables:
     columns:
       - name: start_time
         type: Int64
-        nullable: false
+        nullable: true
         virtual: true
-        description: Start time filter (Unix epoch seconds).
+        description: Start time filter (Unix epoch seconds). Defaults to 24 hours ago when omitted.
         expr: {kind: from_filter, key: start_time}
       - name: end_time
         type: Int64
-        nullable: false
+        nullable: true
         virtual: true
-        description: End time filter (Unix epoch seconds).
+        description: End time filter (Unix epoch seconds). Defaults to now when omitted.
         expr: {kind: from_filter, key: end_time}
       - name: event_id
         type: Utf8
@@ -258,6 +268,16 @@ tables:
         nullable: true
         description: Lambda function name or ARN.
         expr: {kind: path, path: [Resources, "0", ResourceName]}
+      - name: event_source
+        type: Utf8
+        nullable: true
+        description: AWS service that received the call. Always 'lambda.amazonaws.com' for this table.
+        expr: {kind: path, path: [EventSource]}
+      - name: resource_type
+        type: Utf8
+        nullable: true
+        description: AWS resource type, e.g. 'AWS::Lambda::Function'.
+        expr: {kind: path, path: [Resources, "0", ResourceType]}
       - name: cloudtrail_event
         type: Json
         nullable: true
@@ -265,21 +285,22 @@ tables:
         expr: {kind: path, path: [CloudTrailEvent]}
     filters:
       - name: start_time
-        required: true
-        description: Event window start as Unix epoch seconds.
+        description: Event window start as Unix epoch seconds. Defaults to 24 hours ago.
       - name: end_time
-        required: true
-        description: Event window end as Unix epoch seconds.
+        description: Event window end as Unix epoch seconds. Defaults to now.
 
   - name: cloudformation_events
     description: CloudFormation events returned by LookupEvents, scoped to 'cloudformation.amazonaws.com'. Includes both read and write operations.
     guide: >
-      Requires start_time and end_time as Unix epoch seconds. Returns all
-      CloudFormation API calls including read-only ones. The LookupEvents API
-      accepts only one LookupAttribute per request, so ReadOnly=false cannot be
-      combined with the EventSource filter. To restrict to deployments, add
-      WHERE event_name IN ('CreateStack', 'UpdateStack', 'DeleteStack',
-      'ExecuteChangeSet') in your query. Check
+      start_time and end_time are optional Unix epoch seconds. When omitted,
+      start_time defaults to 24 hours ago and end_time defaults to now.
+      Returns all CloudFormation API calls including read-only ones. The
+      LookupEvents API accepts only one LookupAttribute per request, so
+      ReadOnly=false cannot be combined with the EventSource filter. To
+      restrict to deployments, add WHERE event_name IN ('CreateStack',
+      'UpdateStack', 'DeleteStack', 'ExecuteChangeSet') in your query. Queries
+      are capped at 5,000 events (100 pages x 50 results); narrow the time
+      window if your account exceeds this in the requested period. Check
       json_get_str(cloudtrail_event, 'requestParameters', 'clientRequestToken')
       — CI/CD pipelines that set this to the commit SHA give you a direct
       foreign key to the triggering PR without a time-window join.
@@ -294,8 +315,14 @@ tables:
           from: literal
           value: cloudformation.amazonaws.com
         - path: [StartTime]
+          from: now_epoch_minus_seconds
+          seconds: 86400
+        - path: [StartTime]
           from: filter_int
           key: start_time
+        - path: [EndTime]
+          from: now_epoch_minus_seconds
+          seconds: 0
         - path: [EndTime]
           from: filter_int
           key: end_time
@@ -312,15 +339,15 @@ tables:
     columns:
       - name: start_time
         type: Int64
-        nullable: false
+        nullable: true
         virtual: true
-        description: Start time filter (Unix epoch seconds).
+        description: Start time filter (Unix epoch seconds). Defaults to 24 hours ago when omitted.
         expr: {kind: from_filter, key: start_time}
       - name: end_time
         type: Int64
-        nullable: false
+        nullable: true
         virtual: true
-        description: End time filter (Unix epoch seconds).
+        description: End time filter (Unix epoch seconds). Defaults to now when omitted.
         expr: {kind: from_filter, key: end_time}
       - name: event_id
         type: Utf8
@@ -358,6 +385,16 @@ tables:
         nullable: true
         description: CloudFormation stack name.
         expr: {kind: path, path: [Resources, "0", ResourceName]}
+      - name: event_source
+        type: Utf8
+        nullable: true
+        description: AWS service that received the call. Always 'cloudformation.amazonaws.com' for this table.
+        expr: {kind: path, path: [EventSource]}
+      - name: resource_type
+        type: Utf8
+        nullable: true
+        description: AWS resource type, e.g. 'AWS::CloudFormation::Stack'.
+        expr: {kind: path, path: [Resources, "0", ResourceType]}
       - name: cloudtrail_event
         type: Json
         nullable: true
@@ -365,24 +402,26 @@ tables:
         expr: {kind: path, path: [CloudTrailEvent]}
     filters:
       - name: start_time
-        required: true
-        description: Event window start as Unix epoch seconds.
+        description: Event window start as Unix epoch seconds. Defaults to 24 hours ago.
       - name: end_time
-        required: true
-        description: Event window end as Unix epoch seconds.
+        description: Event window end as Unix epoch seconds. Defaults to now.
 
   - name: ec2_events
     description: EC2 events returned by LookupEvents, scoped to 'ec2.amazonaws.com'. Includes both read and write operations.
     guide: >
-      Requires start_time and end_time as Unix epoch seconds. Returns all EC2
-      API calls including read-only ones such as DescribeInstances. The
-      LookupEvents API accepts only one LookupAttribute per request, so
-      ReadOnly=false cannot be combined with the EventSource filter. To restrict
-      to instance lifecycle changes, add WHERE event_name IN ('RunInstances',
-      'TerminateInstances', 'StartInstances', 'StopInstances',
-      'ModifyInstanceAttribute') in your query. Only management (control-plane)
-      events are available here — data events require a Trail with data event
-      logging enabled and are not returned by LookupEvents.
+      start_time and end_time are optional Unix epoch seconds. When omitted,
+      start_time defaults to 24 hours ago and end_time defaults to now.
+      Returns all EC2 API calls including read-only ones such as
+      DescribeInstances. The LookupEvents API accepts only one LookupAttribute
+      per request, so ReadOnly=false cannot be combined with the EventSource
+      filter. To restrict to instance lifecycle changes, add WHERE event_name
+      IN ('RunInstances', 'TerminateInstances', 'StartInstances',
+      'StopInstances', 'ModifyInstanceAttribute') in your query. Queries are
+      capped at 5,000 events (100 pages x 50 results); narrow the time window
+      if your account exceeds this in the requested period. Only
+      management (control-plane) events are available here — data events
+      require a Trail with data event logging enabled and are not returned by
+      LookupEvents.
     request:
       method: POST
       path: /
@@ -394,8 +433,14 @@ tables:
           from: literal
           value: ec2.amazonaws.com
         - path: [StartTime]
+          from: now_epoch_minus_seconds
+          seconds: 86400
+        - path: [StartTime]
           from: filter_int
           key: start_time
+        - path: [EndTime]
+          from: now_epoch_minus_seconds
+          seconds: 0
         - path: [EndTime]
           from: filter_int
           key: end_time
@@ -412,15 +457,15 @@ tables:
     columns:
       - name: start_time
         type: Int64
-        nullable: false
+        nullable: true
         virtual: true
-        description: Start time filter (Unix epoch seconds).
+        description: Start time filter (Unix epoch seconds). Defaults to 24 hours ago when omitted.
         expr: {kind: from_filter, key: start_time}
       - name: end_time
         type: Int64
-        nullable: false
+        nullable: true
         virtual: true
-        description: End time filter (Unix epoch seconds).
+        description: End time filter (Unix epoch seconds). Defaults to now when omitted.
         expr: {kind: from_filter, key: end_time}
       - name: event_id
         type: Utf8
@@ -458,6 +503,11 @@ tables:
         nullable: true
         description: EC2 instance ID (e.g. 'i-0abc123') or resource identifier.
         expr: {kind: path, path: [Resources, "0", ResourceName]}
+      - name: event_source
+        type: Utf8
+        nullable: true
+        description: AWS service that received the call. Always 'ec2.amazonaws.com' for this table.
+        expr: {kind: path, path: [EventSource]}
       - name: resource_type
         type: Utf8
         nullable: true
@@ -470,8 +520,6 @@ tables:
         expr: {kind: path, path: [CloudTrailEvent]}
     filters:
       - name: start_time
-        required: true
-        description: Event window start as Unix epoch seconds.
+        description: Event window start as Unix epoch seconds. Defaults to 24 hours ago.
       - name: end_time
-        required: true
-        description: Event window end as Unix epoch seconds.
+        description: Event window end as Unix epoch seconds. Defaults to now.
