@@ -33,8 +33,17 @@ Create a policy with the following permissions (all read-only):
 }
 ```
 
-Cost Explorer IAM actions only support `Resource: "*"` — resource-level
-scoping is not available.
+The example policy uses `Resource: "*"` for simplicity, which works for
+every action this source calls. Some Cost Explorer actions also support
+resource-level scoping and tag-based conditions if you want to tighten the
+policy: `ce:GetCostAndUsage` and `ce:GetCostForecast` support the
+`billingview` resource type, `ce:GetAnomalies` is scoped to the
+`anomalymonitor` resource type, and these actions accept the
+`aws:ResourceTag/${TagKey}` condition key. `ce:GetRightsizingRecommendation`
+and `ce:GetSavingsPlansCoverage` have no resource type and require
+`Resource: "*"`. See the
+[Cost Explorer service authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_awscostexplorerservice.html)
+for the full action-to-resource mapping.
 
 ### Step 2 — Enable Cost Explorer
 
@@ -74,6 +83,16 @@ and AWS GovCloud (US) does not expose a Cost Explorer endpoint. Coral
 does not read your AWS CLI profile, AWS SSO cache, or `AWS_PROFILE` —
 credentials must be supplied via the four environment variables above
 (or `coral source add --interactive`).
+
+> **Billable API.** Cost Explorer API requests are billed by AWS at
+> $0.01 per paginated request ([pricing](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/pricing/)),
+> independent of the free Cost Explorer console. Coral follows
+> `NextPageToken`/`NextToken` until the result set is exhausted, so a
+> single broad query can issue many billable requests: `cost_by_service`
+> and `cost_by_tag` page up to 100 requests, `anomalies` and
+> `savings_plans_coverage` up to 50, and `rightsizing_recommendations` up
+> to 20. Narrow the time window, filter, or add `LIMIT` to keep wide scans
+> from fanning out into dozens of charges.
 
 ## Tables
 
@@ -121,7 +140,7 @@ WHERE time_period_start = '2026-05-01'
   AND time_period_end   = '2026-06-01'
 ```
 
-To work with individual services, use `json_get_json` on the `groups` column:
+To inspect a single element, use `json_get_json` on the `groups` column:
 
 ```sql
 SELECT
@@ -133,6 +152,32 @@ FROM aws_cost_explorer.cost_by_service
 WHERE time_period_start = '2026-05-01'
   AND time_period_end   = '2026-06-01'
 ```
+
+To analyze **all** services rather than just the first element, expand the
+`groups` array into one row per service with
+`unnest(json_get_array(groups))`, then project the fields you need. This is
+how you answer questions like "top services by spend":
+
+```sql
+SELECT
+    json_get_str(g, 'Keys', 0)                              AS service,
+    CAST(json_get_str(g, 'Metrics', 'UnblendedCost', 'Amount') AS DOUBLE) AS cost_usd
+FROM (
+    SELECT unnest(json_get_array(groups)) AS g
+    FROM aws_cost_explorer.cost_by_service
+    WHERE time_period_start = '2026-05-01'
+      AND time_period_end   = '2026-06-01'
+)
+ORDER BY cost_usd DESC
+LIMIT 10
+```
+
+`json_get_array(groups)` returns the array as a list, `unnest` explodes it to
+one row per element, and `json_get_str(g, 'Keys', 0)` / `json_get_str(g,
+'Metrics', '<metric>', 'Amount')` read each element. Match the metric key to
+the `metric` filter you bound (e.g. `'AmortizedCost'` when
+`metric = 'AmortizedCost'`); it defaults to `UnblendedCost`. Wrap the
+extracted amount in `CAST(... AS DOUBLE)` before sorting or aggregating.
 
 ### `aws_cost_explorer.cost_by_tag`
 
@@ -152,6 +197,26 @@ FROM aws_cost_explorer.cost_by_tag
 WHERE time_period_start = '2026-05-01'
   AND time_period_end   = '2026-06-01'
   AND tag_key           = 'aws:cloudformation:stack-name'
+```
+
+To rank all tag values by spend, expand the `groups` array the same way as
+`cost_by_service` — `unnest(json_get_array(groups))` gives one row per tag
+value. Resources with no value for the tag appear with an empty string as
+the `Keys` value:
+
+```sql
+SELECT
+    json_get_str(g, 'Keys', 0)                              AS tag_value,
+    CAST(json_get_str(g, 'Metrics', 'UnblendedCost', 'Amount') AS DOUBLE) AS cost_usd
+FROM (
+    SELECT unnest(json_get_array(groups)) AS g
+    FROM aws_cost_explorer.cost_by_tag
+    WHERE time_period_start = '2026-05-01'
+      AND time_period_end   = '2026-06-01'
+      AND tag_key           = 'aws:cloudformation:stack-name'
+)
+ORDER BY cost_usd DESC
+LIMIT 10
 ```
 
 ### `aws_cost_explorer.anomalies`
@@ -210,8 +275,11 @@ a prediction beyond. Supported metrics are narrower than `cost_by_service`
 `NET_AMORTIZED_COST`, and `NET_UNBLENDED_COST`.
 
 ```sql
--- Forecast from yesterday through end of next month. Use yesterday's
--- date as the start because earlier starts are rejected by AWS.
+-- Forecast from yesterday through the end of next month. Replace the
+-- dates below with your own run: time_period_start must be "yesterday"
+-- (AWS rejects earlier starts), and time_period_end is exclusive. The
+-- literals here are illustrative for a run on 2026-05-31; substitute the
+-- current yesterday/next-month-start when you query.
 SELECT
     period_start,
     CAST(mean_value AS DOUBLE)                       AS expected_usd,
@@ -223,6 +291,15 @@ WHERE time_period_start         = '2026-05-30'
   AND metric                    = 'UNBLENDED_COST'
   AND prediction_interval_level = 80
 ```
+
+The filters also accept computed expressions, so you can avoid hand-editing
+dates — for example
+`time_period_start = CAST(current_date - INTERVAL '1 day' AS VARCHAR)`.
+Note that "yesterday" is evaluated against AWS's service clock: if the host
+clock lags UTC, a computed `current_date - 1 day` can land one day before
+AWS's earliest supported start and return
+`ValidationException ("Earliest supported Start is …")`. If that happens,
+use the date from the error message (AWS's "yesterday") as the start.
 
 ### `aws_cost_explorer.rightsizing_recommendations`
 
@@ -276,6 +353,11 @@ ORDER BY CAST(on_demand_cost AS DOUBLE) DESC
 
 ## Notes
 
+- **Billable requests:** Cost Explorer API calls cost $0.01 per paginated
+  request. Broad queries paginate (up to 100 requests for `cost_by_service`
+  and `cost_by_tag`), so narrow the window or add `LIMIT` to avoid
+  unexpected charges. See the billable-API note under
+  [Authentication](#authentication).
 - **Data lag:** Cost Explorer data has a ~24-hour lag. The current open month
   is marked `estimated = true`.
 - **End date is exclusive:** `time_period_end = '2026-06-01'` includes all of

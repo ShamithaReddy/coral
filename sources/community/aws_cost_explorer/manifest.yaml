@@ -82,8 +82,14 @@ tables:
       Each row is one time period. groups is a JSON array of
       {"Keys":["<service>"],"Metrics":{"UnblendedCost":{"Amount":"...","Unit":"USD"}}}
       objects — one entry per AWS service. Use json_get_json(groups, 0)
-      to get the first service element, then json_get_str on the result
-      to extract 'Keys' and 'Metrics' fields.
+      to inspect the first service element, then json_get_str on the result
+      to extract 'Keys' and 'Metrics' fields. To analyze ALL services
+      (e.g. "top services by spend"), expand the array into one row per
+      service with unnest(json_get_array(groups)) in a subquery, then
+      project json_get_str(g, 'Keys', 0) for the service and
+      json_get_str(g, 'Metrics', '<metric>', 'Amount') for the cost
+      (match '<metric>' to the bound metric filter; default UnblendedCost).
+      See the README cost_by_service examples for the full query.
     filters:
       - name: time_period_start
         required: true
@@ -185,7 +191,9 @@ tables:
           requested (e.g. Metrics.AmortizedCost.Amount when
           metric = 'AmortizedCost'). Use json_get_json(groups, 0) to read
           the first element, then json_get_str(first_element, 'Keys', 0) for
-          the service name. Per-period totals are not exposed as scalar
+          the service name. To analyze all services in one query, expand
+          with unnest(json_get_array(groups)) in a subquery (see README).
+          Per-period totals are not exposed as scalar
           columns because AWS returns the response Total block empty
           whenever a GroupBy is set; sum across the per-service entries
           here to compute a period-level aggregate.
@@ -195,19 +203,23 @@ tables:
         nullable: true
         virtual: true
         description: >-
-          Cost metric filter used for this query. UnblendedCost (default),
-          AmortizedCost, BlendedCost, NetUnblendedCost,
-          NetAmortizedCost, UsageQuantity, NormalizedUsageAmount.
-          Bind via WHERE metric = '<value>' to retrieve a non-default metric.
+          Cost metric filter used for this query. Defaults to UnblendedCost
+          in the request, but this column is NULL unless you bind it
+          explicitly via WHERE metric = '<value>' — it echoes the bound
+          filter, not the applied default. Other values: AmortizedCost,
+          BlendedCost, NetUnblendedCost, NetAmortizedCost, UsageQuantity,
+          NormalizedUsageAmount.
         expr: {kind: from_filter, key: metric}
       - name: granularity
         type: Utf8
         nullable: true
         virtual: true
         description: >-
-          Aggregation period filter. MONTHLY (default), DAILY, or HOURLY
-          (opt-in, last 14 days, requires ISO-8601 timestamps for
-          time_period_start/end). Bind via WHERE granularity = '<value>'.
+          Aggregation period filter. Defaults to MONTHLY in the request, but
+          this column is NULL unless you bind it explicitly via WHERE
+          granularity = '<value>' — it echoes the bound filter, not the
+          applied default. Other values: DAILY, or HOURLY (opt-in, last 14
+          days, requires ISO-8601 timestamps for time_period_start/end).
         expr: {kind: from_filter, key: granularity}
 
   - name: cost_by_tag
@@ -236,7 +248,13 @@ tables:
       Each row is one time period. groups is a JSON array where each element has
       Keys (the tag value) and Metrics.UnblendedCost.Amount. Resources with no
       value for that tag appear with an empty string as the tag value.
-      Use json_get_json(groups, 0) to read the first element.
+      Use json_get_json(groups, 0) to inspect the first element. To rank ALL
+      tag values by spend, expand the array into one row per tag value with
+      unnest(json_get_array(groups)) in a subquery, then project
+      json_get_str(g, 'Keys', 0) for the tag value and
+      json_get_str(g, 'Metrics', '<metric>', 'Amount') for the cost
+      (match '<metric>' to the bound metric filter; default UnblendedCost).
+      See the README cost_by_tag examples for the full query.
     filters:
       - name: time_period_start
         required: true
@@ -348,7 +366,9 @@ tables:
           requested (e.g. Metrics.AmortizedCost.Amount when
           metric = 'AmortizedCost'). Use json_get_json(groups, 0) to read
           the first element, then json_get_str(first_element, 'Keys', 0) for
-          the tag value. Per-period totals are not exposed as scalar
+          the tag value. To rank all tag values in one query, expand
+          with unnest(json_get_array(groups)) in a subquery (see README).
+          Per-period totals are not exposed as scalar
           columns because AWS returns the response Total block empty
           whenever a GroupBy is set; sum across the per-tag-value entries
           here to compute a period-level aggregate.
@@ -358,19 +378,23 @@ tables:
         nullable: true
         virtual: true
         description: >-
-          Cost metric filter used for this query. UnblendedCost (default),
-          AmortizedCost, BlendedCost, NetUnblendedCost,
-          NetAmortizedCost, UsageQuantity, NormalizedUsageAmount.
-          Bind via WHERE metric = '<value>' to retrieve a non-default metric.
+          Cost metric filter used for this query. Defaults to UnblendedCost
+          in the request, but this column is NULL unless you bind it
+          explicitly via WHERE metric = '<value>' — it echoes the bound
+          filter, not the applied default. Other values: AmortizedCost,
+          BlendedCost, NetUnblendedCost, NetAmortizedCost, UsageQuantity,
+          NormalizedUsageAmount.
         expr: {kind: from_filter, key: metric}
       - name: granularity
         type: Utf8
         nullable: true
         virtual: true
         description: >-
-          Aggregation period filter. MONTHLY (default), DAILY, or HOURLY
-          (opt-in, last 14 days, requires ISO-8601 timestamps for
-          time_period_start/end). Bind via WHERE granularity = '<value>'.
+          Aggregation period filter. Defaults to MONTHLY in the request, but
+          this column is NULL unless you bind it explicitly via WHERE
+          granularity = '<value>' — it echoes the bound filter, not the
+          applied default. Other values: DAILY, or HOURLY (opt-in, last 14
+          days, requires ISO-8601 timestamps for time_period_start/end).
         expr: {kind: from_filter, key: granularity}
 
   - name: anomalies
