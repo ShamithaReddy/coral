@@ -76,13 +76,17 @@ ORDER BY event_time DESC
 LIMIT 50
 ```
 
-### Find Lambda changes near a specific time (for cost spike investigation)
+### Find Lambda changes in the last 24 hours (for cost spike investigation)
+
+Use a rolling window. CloudTrail's `LookupEvents` only returns events from the
+last 90 days, so absolute epoch timestamps will silently age out — keep the
+filter relative to `NOW()`.
 
 ```sql
 SELECT event_name, resource_name, username, event_time, cloudtrail_event
 FROM cloudtrail.lambda_events
-WHERE start_time = 1715558400
-  AND end_time   = 1715644800
+WHERE start_time = CAST(EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours') AS BIGINT)
+  AND end_time   = CAST(EXTRACT(EPOCH FROM NOW()) AS BIGINT)
 ORDER BY event_time DESC
 ```
 
@@ -120,8 +124,8 @@ SELECT
     username,
     json_get_json(cloudtrail_event, 'requestParameters') AS request_params
 FROM cloudtrail.lambda_events
-WHERE start_time = 1715558400
-  AND end_time   = 1715644800
+WHERE start_time = CAST(EXTRACT(EPOCH FROM NOW() - INTERVAL '7 days') AS BIGINT)
+  AND end_time   = CAST(EXTRACT(EPOCH FROM NOW()) AS BIGINT)
   AND event_name = 'UpdateFunctionConfiguration'
 ```
 
