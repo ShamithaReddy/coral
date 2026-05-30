@@ -3,25 +3,29 @@ name: aws_cost_explorer
 version: 0.1.0
 backend: http
 description: >-
-  Query AWS Cost Explorer for cost and usage data, rightsizing recommendations,
-  and Savings Plans coverage. Uses AWS Signature Version 4 authentication.
-  Cost Explorer is a global service; for standard AWS partitions requests
-  go to us-east-1.
+  Query AWS Cost Explorer for historical cost and usage, cost anomalies,
+  cost forecasts, EC2 rightsizing recommendations, and Savings Plans
+  coverage. Uses AWS Signature Version 4 authentication. Cost Explorer is
+  a global service with one regional endpoint per partition — use
+  us-east-1 for the standard AWS partition or cn-northwest-1 for the
+  China partition. AWS GovCloud (US) does not expose a Cost Explorer
+  endpoint.
 inputs:
   AWS_REGION:
     kind: variable
     default: us-east-1
     hint: |
-      AWS region for Cost Explorer API requests. Cost Explorer is a global
-      service — keep `us-east-1` for standard AWS partitions. Use
-      `us-gov-west-1` for AWS GovCloud (US) or `cn-northwest-1` for the
-      China partition.
+      AWS region for Cost Explorer API requests. Cost Explorer is a
+      global service with one regional endpoint per partition — keep
+      `us-east-1` for the standard AWS partition or use `cn-northwest-1`
+      for the China partition. AWS GovCloud (US) does not expose a Cost
+      Explorer endpoint.
   AWS_ENDPOINT_SUFFIX:
     kind: variable
     default: amazonaws.com
     hint: |
-      AWS endpoint DNS suffix. Keep `amazonaws.com` for standard AWS
-      regions. Use `amazonaws.com.cn` for the China partition.
+      AWS endpoint DNS suffix. Keep `amazonaws.com` for the standard AWS
+      partition. Use `amazonaws.com.cn` for the China partition.
   AWS_ACCESS_KEY_ID:
     kind: secret
     hint: |
@@ -50,15 +54,26 @@ request_headers:
     from: literal
     value: application/x-amz-json-1.1
 test_queries:
-  - SELECT instance_id, instance_type, recommendation_type, monthly_cost FROM aws_cost_explorer.rightsizing_recommendations LIMIT 5
-  - SELECT period_start, period_total_cost, estimated FROM aws_cost_explorer.cost_by_service WHERE time_period_start = '2026-04-01' AND time_period_end = '2026-05-01' LIMIT 1
+  - >-
+    SELECT instance_id, instance_type, recommendation_type, monthly_cost
+    FROM aws_cost_explorer.rightsizing_recommendations
+    LIMIT 5
 tables:
+  # AWS Cost Explorer is a JSON-RPC service. Per the public service
+  # model (botocore: data/ce/2017-10-25/service-2.json) the documented
+  # `targetPrefix` is `AWSInsightsIndexService`, which is the value the
+  # AWS SDKs send in `X-Amz-Target`. The prefix is internal-looking and
+  # doesn't appear in the user-facing API reference; do not "fix" it to
+  # something like `AWSCostExplorer` — the wire contract requires this
+  # exact value.
   - name: cost_by_service
     description: >-
       AWS cost per billing period grouped by service, returned by GetCostAndUsage.
       Each row represents one time period. The groups column contains the full
       per-service breakdown as a JSON array — use json_get_json to extract it.
-      Use period_total_cost for the aggregate cost across all services in the period.
+      Because the request always sets a SERVICE GroupBy, AWS returns the
+      response Total block as an empty object, so all per-period totals must
+      come from the per-service entries inside `groups`.
     guide: |
       Requires time_period_start and time_period_end (YYYY-MM-DD, end is exclusive —
       use the first day of the following month to include the full month).
@@ -82,16 +97,20 @@ tables:
           month to include all days. Example: '2026-06-01' for all of May.
       - name: granularity
         description: >-
-          Aggregation period. MONTHLY (default) or DAILY. HOURLY is limited
-          to the last 14 days and requires the hourly-granularity opt-in
-          on the AWS account.
+          Aggregation period. MONTHLY (default) or DAILY. HOURLY is
+          opt-in at the AWS payer-account level and limited to the last
+          14 days; HOURLY also requires time_period_start and
+          time_period_end to be passed as ISO-8601 timestamps
+          (e.g. '2026-05-29T00:00:00Z') instead of YYYY-MM-DD dates,
+          otherwise AWS rejects the request with ValidationException
+          ("Time period is invalid. Valid format is yyyy-MM-ddThh:mm:ssZ.").
       - name: metric
         description: >-
-          Cost metric to retrieve. UNBLENDED_COST (default), AMORTIZED_COST,
-          BLENDED_COST, NET_UNBLENDED_COST, NET_AMORTIZED_COST,
-          USAGE_QUANTITY, NORMALIZED_USAGE_AMOUNT.
-          Use AMORTIZED_COST when the account uses Reserved Instances or
-          Savings Plans — UNBLENDED_COST understates amortized commitment costs.
+          Cost metric to retrieve. UnblendedCost (default), AmortizedCost,
+          BlendedCost, NetUnblendedCost, NetAmortizedCost,
+          UsageQuantity, NormalizedUsageAmount.
+          Use AmortizedCost when the account uses Reserved Instances or
+          Savings Plans — UnblendedCost understates amortized commitment costs.
     request:
       method: POST
       path: /
@@ -119,7 +138,7 @@ tables:
         - path: [Metrics, "0"]
           from: filter
           key: metric
-          default: UNBLENDED_COST
+          default: UnblendedCost
     response:
       rows_path: [ResultsByTime]
     pagination:
@@ -150,46 +169,6 @@ tables:
         nullable: true
         description: Actual end date of this billing period returned by the API.
         expr: {kind: path, path: [TimePeriod, End]}
-      - name: period_total_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total cost across all services for the period, projected from
-          the response key matching the metric the caller requested. When
-          metric = 'AMORTIZED_COST', this reflects Total.AmortizedCost.Amount;
-          when metric = 'UNBLENDED_COST' (the default), this reflects
-          Total.UnblendedCost.Amount; and so on for the other documented
-          metric values. Cast to Float64 before arithmetic:
-          CAST(period_total_cost AS DOUBLE). Use metric = 'AMORTIZED_COST'
-          for accounts with Reserved Instances or Savings Plans.
-        expr:
-          kind: coalesce
-          exprs:
-            - {kind: path, path: [Total, UnblendedCost, Amount]}
-            - {kind: path, path: [Total, AmortizedCost, Amount]}
-            - {kind: path, path: [Total, BlendedCost, Amount]}
-            - {kind: path, path: [Total, NetUnblendedCost, Amount]}
-            - {kind: path, path: [Total, NetAmortizedCost, Amount]}
-            - {kind: path, path: [Total, UsageQuantity, Amount]}
-            - {kind: path, path: [Total, NormalizedUsageAmount, Amount]}
-      - name: unit
-        type: Utf8
-        nullable: true
-        description: >-
-          Currency or usage unit returned by the API for the metric the
-          caller requested. Typically 'USD' for cost metrics; 'Hrs' or
-          similar for USAGE_QUANTITY; unit-less or service-specific for
-          NORMALIZED_USAGE_AMOUNT.
-        expr:
-          kind: coalesce
-          exprs:
-            - {kind: path, path: [Total, UnblendedCost, Unit]}
-            - {kind: path, path: [Total, AmortizedCost, Unit]}
-            - {kind: path, path: [Total, BlendedCost, Unit]}
-            - {kind: path, path: [Total, NetUnblendedCost, Unit]}
-            - {kind: path, path: [Total, NetAmortizedCost, Unit]}
-            - {kind: path, path: [Total, UsageQuantity, Unit]}
-            - {kind: path, path: [Total, NormalizedUsageAmount, Unit]}
       - name: estimated
         type: Boolean
         nullable: true
@@ -204,82 +183,21 @@ tables:
           Full per-service cost breakdown as a JSON array. Each element has
           Keys (service name) and Metrics keyed by the metric the caller
           requested (e.g. Metrics.AmortizedCost.Amount when
-          metric = 'AMORTIZED_COST'). Use json_get_json(groups, 0) to read
+          metric = 'AmortizedCost'). Use json_get_json(groups, 0) to read
           the first element, then json_get_str(first_element, 'Keys', 0) for
-          the service name. Per-metric typed columns (`amortized_cost`,
-          `blended_cost`, …) are also available alongside `groups` for the
-          row-level total without `json_get_str` navigation.
+          the service name. Per-period totals are not exposed as scalar
+          columns because AWS returns the response Total block empty
+          whenever a GroupBy is set; sum across the per-service entries
+          here to compute a period-level aggregate.
         expr: {kind: path, path: [Groups]}
-      - name: unblended_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total UNBLENDED_COST for the period as a string. Non-NULL only
-          when metric is unset (default) or metric = 'UNBLENDED_COST';
-          NULL when the caller selected a different metric.
-          Cast to Float64 before arithmetic.
-        expr: {kind: path, path: [Total, UnblendedCost, Amount]}
-      - name: amortized_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total AMORTIZED_COST for the period as a string. Non-NULL only
-          when metric = 'AMORTIZED_COST'. Use this metric for accounts
-          with Reserved Instances or Savings Plans — UNBLENDED_COST
-          understates amortized commitment costs.
-        expr: {kind: path, path: [Total, AmortizedCost, Amount]}
-      - name: blended_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total BLENDED_COST for the period as a string. Non-NULL only
-          when metric = 'BLENDED_COST'. Cast to Float64 before arithmetic.
-        expr: {kind: path, path: [Total, BlendedCost, Amount]}
-      - name: net_unblended_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total NET_UNBLENDED_COST for the period as a string (unblended
-          cost net of credits and refunds). Non-NULL only when
-          metric = 'NET_UNBLENDED_COST'. Cast to Float64 before arithmetic.
-        expr: {kind: path, path: [Total, NetUnblendedCost, Amount]}
-      - name: net_amortized_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total NET_AMORTIZED_COST for the period as a string (amortized
-          cost net of credits and refunds). Non-NULL only when
-          metric = 'NET_AMORTIZED_COST'. Cast to Float64 before arithmetic.
-        expr: {kind: path, path: [Total, NetAmortizedCost, Amount]}
-      - name: usage_quantity
-        type: Utf8
-        nullable: true
-        description: >-
-          Total USAGE_QUANTITY for the period as a string. Non-NULL only
-          when metric = 'USAGE_QUANTITY'. The aggregate value is unit-less
-          because the API sums quantities across services with different
-          natural units (EC2 hours, S3 GB, DynamoDB request counts) — the
-          companion `unit` column returns 'N/A' for this metric. To get
-          comparable usage figures, query a tag- or service-scoped slice
-          rather than the cross-service aggregate.
-        expr: {kind: path, path: [Total, UsageQuantity, Amount]}
-      - name: normalized_usage_amount
-        type: Utf8
-        nullable: true
-        description: >-
-          Total NORMALIZED_USAGE_AMOUNT for the period as a string,
-          normalized for instance-size-flexibility comparisons across
-          Reserved Instance families. Non-NULL only when
-          metric = 'NORMALIZED_USAGE_AMOUNT'.
-        expr: {kind: path, path: [Total, NormalizedUsageAmount, Amount]}
       - name: metric
         type: Utf8
         nullable: true
         virtual: true
         description: >-
-          Cost metric filter used for this query. UNBLENDED_COST (default),
-          AMORTIZED_COST, BLENDED_COST, NET_UNBLENDED_COST,
-          NET_AMORTIZED_COST, USAGE_QUANTITY, NORMALIZED_USAGE_AMOUNT.
+          Cost metric filter used for this query. UnblendedCost (default),
+          AmortizedCost, BlendedCost, NetUnblendedCost,
+          NetAmortizedCost, UsageQuantity, NormalizedUsageAmount.
           Bind via WHERE metric = '<value>' to retrieve a non-default metric.
         expr: {kind: from_filter, key: metric}
       - name: granularity
@@ -288,7 +206,8 @@ tables:
         virtual: true
         description: >-
           Aggregation period filter. MONTHLY (default), DAILY, or HOURLY
-          (last 14 days, opt-in). Bind via WHERE granularity = '<value>'.
+          (opt-in, last 14 days, requires ISO-8601 timestamps for
+          time_period_start/end). Bind via WHERE granularity = '<value>'.
         expr: {kind: from_filter, key: granularity}
 
   - name: cost_by_tag
@@ -296,12 +215,24 @@ tables:
       AWS cost per billing period grouped by a resource tag key, returned by GetCostAndUsage.
       Each row represents one time period. The groups column contains the full per-tag-value
       breakdown as a JSON array. Use tag_key = 'aws:cloudformation:stack-name' to attribute
-      cost to CloudFormation stacks and correlate with deployment events.
+      cost to CloudFormation stacks and correlate with deployment events. Because the
+      request always sets a TAG GroupBy, AWS returns the response Total block as an
+      empty object, so all per-period totals must come from the per-tag-value entries
+      inside `groups`.
     guide: |
       Requires time_period_start, time_period_end (YYYY-MM-DD, end exclusive),
-      and tag_key. The tag key must be activated as a cost allocation tag in the
-      AWS Billing console. The AWS-managed tag 'aws:cloudformation:stack-name'
-      is automatically activated and does not require manual activation.
+      and tag_key. The tag key must be activated as a cost allocation tag in
+      the AWS Billing and Cost Management console under Cost Allocation Tags
+      before it appears here. This applies to both user-defined tags
+      (under "User-Defined Cost Allocation Tags") and AWS-generated tags like
+      'aws:cloudformation:stack-name' (under "AWS-Generated Cost Allocation
+      Tags") — neither type is active by default.
+      Activation is non-retroactive: costs incurred before the tag was
+      activated do not get tagged after the fact, so a freshly activated
+      tag will show empty values for older billing periods.
+      In AWS Organizations, only the management account can activate cost
+      allocation tags; member-account credentials querying this table will
+      return empty tag values until the org owner activates the key.
       Each row is one time period. groups is a JSON array where each element has
       Keys (the tag value) and Metrics.UnblendedCost.Amount. Resources with no
       value for that tag appear with an empty string as the tag value.
@@ -316,21 +247,29 @@ tables:
       - name: tag_key
         required: true
         description: >-
-          The AWS tag key to group costs by. Use 'aws:cloudformation:stack-name'
-          to attribute costs to CloudFormation stacks. User-defined tags must be
-          activated in Billing → Cost allocation tags first.
+          The AWS tag key to group costs by. Use
+          'aws:cloudformation:stack-name' to attribute costs to
+          CloudFormation stacks. Both user-defined and AWS-generated
+          (`aws:` prefix) tag keys must be activated under
+          Billing → Cost Allocation Tags before they return any data
+          here, and only the management account can activate them in
+          AWS Organizations.
       - name: granularity
         description: >-
-          Aggregation period. MONTHLY (default) or DAILY. HOURLY is limited
-          to the last 14 days and requires the hourly-granularity opt-in
-          on the AWS account.
+          Aggregation period. MONTHLY (default) or DAILY. HOURLY is
+          opt-in at the AWS payer-account level and limited to the last
+          14 days; HOURLY also requires time_period_start and
+          time_period_end to be passed as ISO-8601 timestamps
+          (e.g. '2026-05-29T00:00:00Z') instead of YYYY-MM-DD dates,
+          otherwise AWS rejects the request with ValidationException
+          ("Time period is invalid. Valid format is yyyy-MM-ddThh:mm:ssZ.").
       - name: metric
         description: >-
-          Cost metric to retrieve. UNBLENDED_COST (default), AMORTIZED_COST,
-          BLENDED_COST, NET_UNBLENDED_COST, NET_AMORTIZED_COST,
-          USAGE_QUANTITY, NORMALIZED_USAGE_AMOUNT.
-          Use AMORTIZED_COST when the account uses Reserved Instances or
-          Savings Plans — UNBLENDED_COST understates amortized commitment costs.
+          Cost metric to retrieve. UnblendedCost (default), AmortizedCost,
+          BlendedCost, NetUnblendedCost, NetAmortizedCost,
+          UsageQuantity, NormalizedUsageAmount.
+          Use AmortizedCost when the account uses Reserved Instances or
+          Savings Plans — UnblendedCost understates amortized commitment costs.
     request:
       method: POST
       path: /
@@ -358,7 +297,7 @@ tables:
         - path: [Metrics, "0"]
           from: filter
           key: metric
-          default: UNBLENDED_COST
+          default: UnblendedCost
     response:
       rows_path: [ResultsByTime]
     pagination:
@@ -395,46 +334,6 @@ tables:
         nullable: true
         description: Actual end date of this billing period returned by the API.
         expr: {kind: path, path: [TimePeriod, End]}
-      - name: period_total_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total cost across all tag values for the period, projected from
-          the response key matching the metric the caller requested. When
-          metric = 'AMORTIZED_COST', this reflects Total.AmortizedCost.Amount;
-          when metric = 'UNBLENDED_COST' (the default), this reflects
-          Total.UnblendedCost.Amount; and so on for the other documented
-          metric values. Cast to Float64 before arithmetic:
-          CAST(period_total_cost AS DOUBLE). Use metric = 'AMORTIZED_COST'
-          for accounts with Reserved Instances or Savings Plans.
-        expr:
-          kind: coalesce
-          exprs:
-            - {kind: path, path: [Total, UnblendedCost, Amount]}
-            - {kind: path, path: [Total, AmortizedCost, Amount]}
-            - {kind: path, path: [Total, BlendedCost, Amount]}
-            - {kind: path, path: [Total, NetUnblendedCost, Amount]}
-            - {kind: path, path: [Total, NetAmortizedCost, Amount]}
-            - {kind: path, path: [Total, UsageQuantity, Amount]}
-            - {kind: path, path: [Total, NormalizedUsageAmount, Amount]}
-      - name: unit
-        type: Utf8
-        nullable: true
-        description: >-
-          Currency or usage unit returned by the API for the metric the
-          caller requested. Typically 'USD' for cost metrics; 'Hrs' or
-          similar for USAGE_QUANTITY; unit-less or service-specific for
-          NORMALIZED_USAGE_AMOUNT.
-        expr:
-          kind: coalesce
-          exprs:
-            - {kind: path, path: [Total, UnblendedCost, Unit]}
-            - {kind: path, path: [Total, AmortizedCost, Unit]}
-            - {kind: path, path: [Total, BlendedCost, Unit]}
-            - {kind: path, path: [Total, NetUnblendedCost, Unit]}
-            - {kind: path, path: [Total, NetAmortizedCost, Unit]}
-            - {kind: path, path: [Total, UsageQuantity, Unit]}
-            - {kind: path, path: [Total, NormalizedUsageAmount, Unit]}
       - name: estimated
         type: Boolean
         nullable: true
@@ -447,92 +346,21 @@ tables:
           Full per-tag-value cost breakdown as a JSON array. Each element has
           Keys (the tag value) and Metrics keyed by the metric the caller
           requested (e.g. Metrics.AmortizedCost.Amount when
-          metric = 'AMORTIZED_COST'). Use json_get_json(groups, 0) to read
+          metric = 'AmortizedCost'). Use json_get_json(groups, 0) to read
           the first element, then json_get_str(first_element, 'Keys', 0) for
-          the tag value. Per-metric typed columns (`amortized_cost`,
-          `blended_cost`, …) are also available alongside `groups` for the
-          row-level total without `json_get_str` navigation.
+          the tag value. Per-period totals are not exposed as scalar
+          columns because AWS returns the response Total block empty
+          whenever a GroupBy is set; sum across the per-tag-value entries
+          here to compute a period-level aggregate.
         expr: {kind: path, path: [Groups]}
-      - name: unblended_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total UNBLENDED_COST for the period across all tag values, as a
-          string. Non-NULL only when metric is unset (default) or
-          metric = 'UNBLENDED_COST'; NULL when the caller selected a
-          different metric. For per-tag-value breakdowns use the `groups`
-          JSON column. Cast to Float64 before arithmetic.
-        expr: {kind: path, path: [Total, UnblendedCost, Amount]}
-      - name: amortized_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total AMORTIZED_COST for the period across all tag values, as a
-          string. Non-NULL only when metric = 'AMORTIZED_COST'. For
-          per-tag-value breakdowns use the `groups` JSON column. Use this
-          metric for accounts with Reserved Instances or Savings Plans —
-          UNBLENDED_COST understates amortized commitment costs.
-        expr: {kind: path, path: [Total, AmortizedCost, Amount]}
-      - name: blended_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total BLENDED_COST for the period across all tag values, as a
-          string. Non-NULL only when metric = 'BLENDED_COST'. For
-          per-tag-value breakdowns use the `groups` JSON column. Cast to
-          Float64 before arithmetic.
-        expr: {kind: path, path: [Total, BlendedCost, Amount]}
-      - name: net_unblended_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total NET_UNBLENDED_COST for the period across all tag values
-          (unblended cost net of credits and refunds), as a string. Non-NULL
-          only when metric = 'NET_UNBLENDED_COST'. For per-tag-value
-          breakdowns use the `groups` JSON column. Cast to Float64 before
-          arithmetic.
-        expr: {kind: path, path: [Total, NetUnblendedCost, Amount]}
-      - name: net_amortized_cost
-        type: Utf8
-        nullable: true
-        description: >-
-          Total NET_AMORTIZED_COST for the period across all tag values
-          (amortized cost net of credits and refunds), as a string. Non-NULL
-          only when metric = 'NET_AMORTIZED_COST'. For per-tag-value
-          breakdowns use the `groups` JSON column. Cast to Float64 before
-          arithmetic.
-        expr: {kind: path, path: [Total, NetAmortizedCost, Amount]}
-      - name: usage_quantity
-        type: Utf8
-        nullable: true
-        description: >-
-          Total USAGE_QUANTITY for the period across all tag values, as a
-          string. Non-NULL only when metric = 'USAGE_QUANTITY'. The
-          aggregate value is unit-less because the API sums quantities
-          across services with different natural units (EC2 hours, S3 GB,
-          DynamoDB request counts) — the companion `unit` column returns
-          'N/A' for this metric. To get comparable usage figures, query a
-          service-scoped slice rather than the cross-service aggregate.
-          For per-tag-value breakdowns use the `groups` JSON column.
-        expr: {kind: path, path: [Total, UsageQuantity, Amount]}
-      - name: normalized_usage_amount
-        type: Utf8
-        nullable: true
-        description: >-
-          Total NORMALIZED_USAGE_AMOUNT for the period across all tag
-          values, as a string, normalized for instance-size-flexibility
-          comparisons across Reserved Instance families. Non-NULL only when
-          metric = 'NORMALIZED_USAGE_AMOUNT'. For per-tag-value breakdowns
-          use the `groups` JSON column.
-        expr: {kind: path, path: [Total, NormalizedUsageAmount, Amount]}
       - name: metric
         type: Utf8
         nullable: true
         virtual: true
         description: >-
-          Cost metric filter used for this query. UNBLENDED_COST (default),
-          AMORTIZED_COST, BLENDED_COST, NET_UNBLENDED_COST,
-          NET_AMORTIZED_COST, USAGE_QUANTITY, NORMALIZED_USAGE_AMOUNT.
+          Cost metric filter used for this query. UnblendedCost (default),
+          AmortizedCost, BlendedCost, NetUnblendedCost,
+          NetAmortizedCost, UsageQuantity, NormalizedUsageAmount.
           Bind via WHERE metric = '<value>' to retrieve a non-default metric.
         expr: {kind: from_filter, key: metric}
       - name: granularity
@@ -541,7 +369,8 @@ tables:
         virtual: true
         description: >-
           Aggregation period filter. MONTHLY (default), DAILY, or HOURLY
-          (last 14 days, opt-in). Bind via WHERE granularity = '<value>'.
+          (opt-in, last 14 days, requires ISO-8601 timestamps for
+          time_period_start/end). Bind via WHERE granularity = '<value>'.
         expr: {kind: from_filter, key: granularity}
 
   - name: anomalies
@@ -557,6 +386,11 @@ tables:
       Anomalies are retained for up to 90 days. Newer accounts (less than ~5
       weeks of billing history) may return no results because AWS needs that
       minimum baseline to detect spikes.
+      date_interval_end has an upper bound of "yesterday" — AWS rejects
+      end dates of today or later with ValidationException ("Latest
+      supported detectionDate for GetRecentAnomalies is …"). Use the
+      previous day's date as the inclusive upper edge of the search
+      window.
       anomaly_end_date is null for anomalies that are still active (the spike
       has not ended). Use IS NULL to find ongoing anomalies.
       total_impact is the dollar difference between actual and expected
@@ -576,7 +410,11 @@ tables:
           billing period.
       - name: date_interval_end
         required: true
-        description: End of the anomaly search window. Format YYYY-MM-DD.
+        description: >-
+          End of the anomaly search window. Format YYYY-MM-DD. Must be
+          yesterday or earlier — AWS rejects today/future end dates with
+          ValidationException ("Latest supported detectionDate for
+          GetRecentAnomalies is …").
       - name: total_impact_min
         description: >-
           Minimum total dollar impact to include. Filters out low-value
@@ -617,6 +455,9 @@ tables:
         - path: [MonitorArn]
           from: filter
           key: monitor_arn
+        # GetAnomalies MaxResults is the PageSize integer (no documented
+        # max). 100 is an arbitrary page-size choice within the legal
+        # range; pagination chases NextPageToken until exhaustion.
         - path: [MaxResults]
           from: literal
           value: 100
@@ -749,17 +590,29 @@ tables:
 
   - name: cost_forecast
     description: >-
-      Projected cost for a future or in-progress billing period, returned by
+      Projected cost for an in-progress or future billing period, returned by
       GetCostForecast. Returns a mean prediction with a configurable
       confidence interval per sub-period. Use to project end-of-month
       spend, size the impact of a recent infrastructure change, or answer
       'are we going to exceed budget?' in an agent session.
     guide: |
       Requires time_period_start, time_period_end, granularity, and metric.
-      time_period_start must be today or a future date — past dates return
-      ValidationException. To forecast the remainder of the current month,
-      set time_period_start to today and time_period_end to the first of
-      next month.
+      time_period_start has a hard lower bound of "yesterday" — AWS
+      rejects earlier start dates with ValidationException ("Earliest
+      supported Start is …"). Future start dates are accepted in practice
+      even though AWS docs say the start "must be equal to or no later
+      than the current date"; in live tests, AWS returns
+      DataUnavailableException ("Insufficient amount of historical
+      data") rather than rejecting the start date itself when there is
+      no history to forecast from. The forecast covers
+      time_period_start through time_period_end exclusive; AWS blends
+      actuals up to today with a prediction beyond.
+      time_period_end has its own ceiling: AWS rejects ends more than ~3
+      months ahead at DAILY granularity (or ~18 months ahead at MONTHLY)
+      with ValidationException ("Latest supported End is …").
+      To forecast the full current month from yesterday onward, set
+      time_period_start to yesterday and time_period_end to the first
+      of next month.
       The supported metric set is narrower than cost_by_service /
       cost_by_tag: only AMORTIZED_COST, BLENDED_COST, NET_AMORTIZED_COST,
       NET_UNBLENDED_COST, and UNBLENDED_COST. USAGE_QUANTITY and
@@ -774,13 +627,20 @@ tables:
       - name: time_period_start
         required: true
         description: >-
-          Start of the forecast period. Must be today or a future date.
-          Format YYYY-MM-DD. Use today's date to forecast the rest of the
-          current month.
+          Start of the forecast period, inclusive. Must be yesterday or
+          later — AWS rejects earlier starts with ValidationException
+          ("Earliest supported Start is …"). Future starts are accepted
+          in practice (AWS returns DataUnavailableException when there
+          is no data to forecast). Format YYYY-MM-DD. Use yesterday's
+          date to forecast from the most recent settled day, or a
+          future date to forecast a future window.
       - name: time_period_end
         required: true
         description: >-
           End of the forecast period, exclusive. Format YYYY-MM-DD.
+          AWS caps the end date at today + ~3 months for DAILY (or
+          today + ~18 months for MONTHLY) and rejects later dates with
+          ValidationException ("Latest supported End is …").
       - name: granularity
         required: true
         description: >-
@@ -910,7 +770,10 @@ tables:
       larger savings but may change network and CPU performance and require
       application testing.
       `estimated_monthly_savings` reflects the MODIFY target's first option
-      OR the TERMINATE detail, depending on `recommendation_type`. When
+      in the response array OR the TERMINATE detail, depending on
+      `recommendation_type`. AWS may return multiple modify candidates and
+      flags the recommended one with `DefaultTargetInstance`, but this
+      manifest currently surfaces only the array's first element. When
       `recommendation_type = 'TERMINATE'`, `target_instance_type` is NULL
       because there is no replacement instance.
     filters:
@@ -944,6 +807,9 @@ tables:
           from: filter_bool
           key: benefits_considered
           default: true
+        # GetRightsizingRecommendation PageSize is RecommendationsPageSize
+        # (max 6000). 100 keeps per-call payloads small; pagination
+        # chases NextPageToken until exhaustion.
         - path: [PageSize]
           from: literal
           value: 100
@@ -994,10 +860,12 @@ tables:
         nullable: true
         description: >-
           Estimated monthly savings if the recommendation is applied, as a
-          string. For MODIFY recommendations, reflects the first
-          (highest-savings) target instance only — AWS may return multiple
-          options. For TERMINATE recommendations, reflects the full
-          terminate savings (the entire instance cost). Cast to Float64
+          string. For MODIFY recommendations, reflects the first target
+          instance returned by AWS — AWS marks the recommended option with
+          `DefaultTargetInstance: true`, but this column projects the
+          array's first element regardless of that flag. For TERMINATE
+          recommendations, reflects the full terminate savings (the entire
+          instance cost). Cast to Float64
           before arithmetic.
         expr:
           kind: coalesce
@@ -1031,8 +899,10 @@ tables:
         description: >-
           Recommended target instance type for MODIFY recommendations.
           NULL for TERMINATE recommendations (no replacement instance).
-          Reflects the first (primary) target option — AWS may return
-          multiple candidates.
+          Reflects the first target instance returned by AWS — AWS marks
+          the recommended option with `DefaultTargetInstance: true`, but
+          this column projects the array's first element regardless of
+          that flag.
         expr:
           {kind: path, path: [ModifyRecommendationDetail, TargetInstances, "0", ResourceDetails, EC2ResourceDetails, InstanceType]}
       - name: recommendation_target
@@ -1060,8 +930,11 @@ tables:
       purchasing or expanding a Savings Plan.
     guide: |
       Requires time_period_start and time_period_end (YYYY-MM-DD, end exclusive).
-      The Start date must be within the last 13 months. coverage_pct below 80
-      with significant on_demand_cost is a strong signal to review commitment
+      The Start date must be within the last 13 months. time_period_end
+      is exclusive and AWS rejects end dates after today with
+      ValidationException ("end date should NOT be after [today]"); use
+      today's date for an in-progress month. coverage_pct below 80 with
+      significant on_demand_cost is a strong signal to review commitment
       purchases. New Savings Plans take up to 72 hours to fully appear in
       coverage data.
       total_cost is the sum of on_demand_cost and spend_covered_by_savings_plans
@@ -1073,7 +946,10 @@ tables:
         description: Start of the coverage period, inclusive. Format YYYY-MM-DD.
       - name: time_period_end
         required: true
-        description: End of the coverage period, exclusive. Format YYYY-MM-DD.
+        description: >-
+          End of the coverage period, exclusive. Format YYYY-MM-DD. Must
+          be today or earlier — AWS rejects end dates after today with
+          ValidationException ("end date should NOT be after [today]").
     request:
       method: POST
       path: /
@@ -1094,6 +970,9 @@ tables:
         - path: [GroupBy, "0", Key]
           from: literal
           value: SERVICE
+        # GetSavingsPlansCoverage MaxResults is MaxResults (min 1, no
+        # documented max; AWS default is 20). 100 keeps round-trips
+        # bounded; pagination chases NextToken until exhaustion.
         - path: [MaxResults]
           from: literal
           value: 100
@@ -1136,17 +1015,18 @@ tables:
         type: Utf8
         nullable: true
         description: >-
-          Percentage of on-demand hours covered by Savings Plans, as a string.
-          Cast to Float64: CAST(coverage_pct AS DOUBLE). Values below 80 indicate
-          significant uncovered spend.
-        expr: {kind: path, path: [Coverage, CoverageHours, CoverageHoursPercentage]}
+          Percentage of eligible Savings Plans usage covered by an active
+          Savings Plan, as a string. Cast to Float64:
+          CAST(coverage_pct AS DOUBLE). Values below 80 indicate significant
+          uncovered spend.
+        expr: {kind: path, path: [Coverage, CoveragePercentage]}
       - name: on_demand_cost
         type: Utf8
         nullable: true
         description: >-
           On-demand spend not covered by any Savings Plan, as a string.
           Cast to Float64 for calculations.
-        expr: {kind: path, path: [Coverage, CoverageCost, OnDemandCost]}
+        expr: {kind: path, path: [Coverage, OnDemandCost]}
       - name: spend_covered_by_savings_plans
         type: Utf8
         nullable: true
@@ -1154,11 +1034,11 @@ tables:
           Spend covered by an active Savings Plan, as a string.
           Cast to Float64: CAST(spend_covered_by_savings_plans AS DOUBLE).
           Sum with on_demand_cost to get total compute spend.
-        expr: {kind: path, path: [Coverage, CoverageCost, SpendCoveredBySavingsPlans]}
+        expr: {kind: path, path: [Coverage, SpendCoveredBySavingsPlans]}
       - name: total_cost
         type: Utf8
         nullable: true
         description: >-
           Total compute spend (on_demand_cost + spend_covered_by_savings_plans)
           for this service grouping, as a string. Cast to Float64 for calculations.
-        expr: {kind: path, path: [Coverage, CoverageCost, TotalCost]}
+        expr: {kind: path, path: [Coverage, TotalCost]}
