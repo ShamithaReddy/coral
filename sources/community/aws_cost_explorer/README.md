@@ -46,6 +46,16 @@ After activation, the API becomes available within 24 hours.
 
 Attach the policy to an IAM user and generate an access key pair.
 
+> **Long-term IAM keys only.** This source signs requests with the
+> `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` pair as-is. Temporary
+> credentials that require a session token — STS `AssumeRole`, IAM
+> Identity Center / SSO, EC2 instance roles, EKS / IRSA — are **not
+> supported** because `AWS_SESSION_TOKEN` is not threaded through the
+> SigV4 authenticator yet. Access keys whose ID starts with `ASIA` are
+> session-scoped and will fail with `InvalidClientTokenId` or
+> `SignatureDoesNotMatch`. Use a long-term IAM user key (the ID starts
+> with `AKIA`).
+
 ### Step 4 — Add the source
 
 ```sh
