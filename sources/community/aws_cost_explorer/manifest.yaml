@@ -123,7 +123,10 @@ tables:
     response:
       rows_path: [ResultsByTime]
     pagination:
-      mode: none
+      mode: cursor_body
+      cursor_body_path: [NextPageToken]
+      response_cursor_path: [NextPageToken]
+      max_pages: 100
     columns:
       - name: time_period_start
         type: Utf8
@@ -359,7 +362,10 @@ tables:
     response:
       rows_path: [ResultsByTime]
     pagination:
-      mode: none
+      mode: cursor_body
+      cursor_body_path: [NextPageToken]
+      response_cursor_path: [NextPageToken]
+      max_pages: 100
     columns:
       - name: time_period_start
         type: Utf8
@@ -451,63 +457,73 @@ tables:
         type: Utf8
         nullable: true
         description: >-
-          Total UNBLENDED_COST for the tag value group as a string. Non-NULL
-          only when metric is unset (default) or metric = 'UNBLENDED_COST';
-          NULL when the caller selected a different metric.
-          Cast to Float64 before arithmetic.
+          Total UNBLENDED_COST for the period across all tag values, as a
+          string. Non-NULL only when metric is unset (default) or
+          metric = 'UNBLENDED_COST'; NULL when the caller selected a
+          different metric. For per-tag-value breakdowns use the `groups`
+          JSON column. Cast to Float64 before arithmetic.
         expr: {kind: path, path: [Total, UnblendedCost, Amount]}
       - name: amortized_cost
         type: Utf8
         nullable: true
         description: >-
-          Total AMORTIZED_COST for the tag value group as a string. Non-NULL
-          only when metric = 'AMORTIZED_COST'. Use this metric for accounts
-          with Reserved Instances or Savings Plans — UNBLENDED_COST
-          understates amortized commitment costs.
+          Total AMORTIZED_COST for the period across all tag values, as a
+          string. Non-NULL only when metric = 'AMORTIZED_COST'. For
+          per-tag-value breakdowns use the `groups` JSON column. Use this
+          metric for accounts with Reserved Instances or Savings Plans —
+          UNBLENDED_COST understates amortized commitment costs.
         expr: {kind: path, path: [Total, AmortizedCost, Amount]}
       - name: blended_cost
         type: Utf8
         nullable: true
         description: >-
-          Total BLENDED_COST for the tag value group as a string. Non-NULL
-          only when metric = 'BLENDED_COST'. Cast to Float64 before arithmetic.
+          Total BLENDED_COST for the period across all tag values, as a
+          string. Non-NULL only when metric = 'BLENDED_COST'. For
+          per-tag-value breakdowns use the `groups` JSON column. Cast to
+          Float64 before arithmetic.
         expr: {kind: path, path: [Total, BlendedCost, Amount]}
       - name: net_unblended_cost
         type: Utf8
         nullable: true
         description: >-
-          Total NET_UNBLENDED_COST for the tag value group as a string
-          (unblended cost net of credits and refunds). Non-NULL only when
-          metric = 'NET_UNBLENDED_COST'. Cast to Float64 before arithmetic.
+          Total NET_UNBLENDED_COST for the period across all tag values
+          (unblended cost net of credits and refunds), as a string. Non-NULL
+          only when metric = 'NET_UNBLENDED_COST'. For per-tag-value
+          breakdowns use the `groups` JSON column. Cast to Float64 before
+          arithmetic.
         expr: {kind: path, path: [Total, NetUnblendedCost, Amount]}
       - name: net_amortized_cost
         type: Utf8
         nullable: true
         description: >-
-          Total NET_AMORTIZED_COST for the tag value group as a string
-          (amortized cost net of credits and refunds). Non-NULL only when
-          metric = 'NET_AMORTIZED_COST'. Cast to Float64 before arithmetic.
+          Total NET_AMORTIZED_COST for the period across all tag values
+          (amortized cost net of credits and refunds), as a string. Non-NULL
+          only when metric = 'NET_AMORTIZED_COST'. For per-tag-value
+          breakdowns use the `groups` JSON column. Cast to Float64 before
+          arithmetic.
         expr: {kind: path, path: [Total, NetAmortizedCost, Amount]}
       - name: usage_quantity
         type: Utf8
         nullable: true
         description: >-
-          Total USAGE_QUANTITY for the tag value group as a string. Non-NULL
-          only when metric = 'USAGE_QUANTITY'. The aggregate value is
-          unit-less because the API sums quantities across services with
-          different natural units (EC2 hours, S3 GB, DynamoDB request
-          counts) — the companion `unit` column returns 'N/A' for this
-          metric. To get comparable usage figures, query a service-scoped
-          slice rather than the cross-service aggregate.
+          Total USAGE_QUANTITY for the period across all tag values, as a
+          string. Non-NULL only when metric = 'USAGE_QUANTITY'. The
+          aggregate value is unit-less because the API sums quantities
+          across services with different natural units (EC2 hours, S3 GB,
+          DynamoDB request counts) — the companion `unit` column returns
+          'N/A' for this metric. To get comparable usage figures, query a
+          service-scoped slice rather than the cross-service aggregate.
+          For per-tag-value breakdowns use the `groups` JSON column.
         expr: {kind: path, path: [Total, UsageQuantity, Amount]}
       - name: normalized_usage_amount
         type: Utf8
         nullable: true
         description: >-
-          Total NORMALIZED_USAGE_AMOUNT for the tag value group as a string,
-          normalized for instance-size-flexibility comparisons across
-          Reserved Instance families. Non-NULL only when
-          metric = 'NORMALIZED_USAGE_AMOUNT'.
+          Total NORMALIZED_USAGE_AMOUNT for the period across all tag
+          values, as a string, normalized for instance-size-flexibility
+          comparisons across Reserved Instance families. Non-NULL only when
+          metric = 'NORMALIZED_USAGE_AMOUNT'. For per-tag-value breakdowns
+          use the `groups` JSON column.
         expr: {kind: path, path: [Total, NormalizedUsageAmount, Amount]}
       - name: metric
         type: Utf8
@@ -1072,9 +1088,6 @@ tables:
         - path: [TimePeriod, End]
           from: filter
           key: time_period_end
-        - path: [Granularity]
-          from: literal
-          value: MONTHLY
         - path: [GroupBy, "0", Type]
           from: literal
           value: DIMENSION
