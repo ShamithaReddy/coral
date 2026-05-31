@@ -178,8 +178,13 @@ ORDER BY event_time DESC
   regional copy — `coral source add` rejects a custom name when `--file` is
   used. To query another region, change `AWS_REGION` and re-add, or maintain
   separate workspaces per region.
-- **Global-service events live in us-east-1:** As of November 22, 2021, AWS
-  records IAM, AWS STS, and CloudFront events in the Region where they occur,
-  which is `us-east-1`. Use `AWS_REGION=us-east-1` when you are looking for
-  identity, access-key, IAM policy, or CloudFront changes; other regions will
-  not surface them.
+- **Global-service events (IAM / CloudFront) live in us-east-1:** As of
+  November 22, 2021, AWS records IAM and CloudFront events in the Region where
+  they occur, which is `us-east-1`. Use `AWS_REGION=us-east-1` when you are
+  looking for identity, access-key, IAM policy, or CloudFront changes; other
+  regions will not surface them.
+- **AWS STS events depend on the endpoint:** Calls to the global STS endpoint
+  (`sts.amazonaws.com`) are recorded in `us-east-1`, while calls to a regional
+  STS endpoint (e.g. `sts.us-west-2.amazonaws.com`) are recorded in that
+  region. Query the region matching the endpoint your workloads use; if you
+  rely on regional STS endpoints, `us-east-1` alone will miss those events.

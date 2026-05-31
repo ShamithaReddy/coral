@@ -21,9 +21,11 @@ inputs:
       resources are deployed. To switch regions, change AWS_REGION and re-add
       the source; because the source name is fixed as `cloudtrail`, re-adding
       replaces the existing source rather than creating a second regional copy.
-      Global-service events (IAM, AWS STS, CloudFront) are recorded in
-      us-east-1, so use us-east-1 to find identity, access-key, policy, or
-      CloudFront changes.
+      Global-service events for IAM and CloudFront are recorded in us-east-1,
+      so use us-east-1 to find identity, access-key, policy, or CloudFront
+      changes. AWS STS events depend on the endpoint: global-endpoint
+      (sts.amazonaws.com) calls land in us-east-1, while regional-endpoint
+      calls are recorded in that region.
       Common values: us-east-1, us-west-2, eu-west-1, eu-central-1,
       ap-southeast-1, ap-northeast-1.
   AWS_ENDPOINT_SUFFIX:
