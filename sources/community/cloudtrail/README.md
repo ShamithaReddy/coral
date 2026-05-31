@@ -171,5 +171,15 @@ ORDER BY event_time DESC
   and gateways together. To see every referenced resource, read the full
   array with `json_get_json(cloudtrail_event, 'resources')` rather than
   relying on the single `resource_name`/`resource_type` columns.
-- **Region matters:** Each region has its own CloudTrail event history. Query
-  the region where your resources are deployed.
+- **One region per workspace:** Each region has its own CloudTrail event
+  history. This source queries the single region in `AWS_REGION`. The source
+  name is fixed as `cloudtrail`, so re-adding the manifest with a different
+  `AWS_REGION` **replaces** the existing source rather than creating a second
+  regional copy — `coral source add` rejects a custom name when `--file` is
+  used. To query another region, change `AWS_REGION` and re-add, or maintain
+  separate workspaces per region.
+- **Global-service events live in us-east-1:** As of November 22, 2021, AWS
+  records IAM, AWS STS, and CloudFront events in the Region where they occur,
+  which is `us-east-1`. Use `AWS_REGION=us-east-1` when you are looking for
+  identity, access-key, IAM policy, or CloudFront changes; other regions will
+  not surface them.

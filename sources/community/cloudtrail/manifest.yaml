@@ -16,9 +16,14 @@ inputs:
     default: us-east-1
     hint: |
       AWS region for CloudTrail API requests. CloudTrail is regional — each
-      region maintains its own independent event history. Query the region
-      where your resources are deployed. To cover multiple regions, add this
-      source once per region with a different AWS_REGION value.
+      region maintains its own independent event history, so this source
+      queries one region per workspace. Set it to the region where your
+      resources are deployed. To switch regions, change AWS_REGION and re-add
+      the source; because the source name is fixed as `cloudtrail`, re-adding
+      replaces the existing source rather than creating a second regional copy.
+      Global-service events (IAM, AWS STS, CloudFront) are recorded in
+      us-east-1, so use us-east-1 to find identity, access-key, policy, or
+      CloudFront changes.
       Common values: us-east-1, us-west-2, eu-west-1, eu-central-1,
       ap-southeast-1, ap-northeast-1.
   AWS_ENDPOINT_SUFFIX:
