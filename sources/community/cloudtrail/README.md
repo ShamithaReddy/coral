@@ -139,19 +139,23 @@ ORDER BY event_time DESC
 ## Notes
 
 - **`management_events` is the only write-only table:** It uses `ReadOnly=false` as its single LookupAttribute. The LookupEvents API accepts only one attribute per request, so the service-scoped tables (`lambda_events`, `cloudformation_events`, `ec2_events`) use `EventSource` as their filter and return both read and write operations. Use `WHERE event_name IN (...)` or `WHERE read_only = 'false'` in your query to restrict to mutations.
-- **`event_name` and `read_only` filters are post-fetch (client-side):** For the service-scoped tables, the `EventSource` filter is the only server-side filter. Any `WHERE event_name` or `WHERE read_only` clause is applied locally after Coral retrieves results. In high-volume accounts the 5,000-event cap (100 pages × 50) may be reached on reads before the target mutations are fetched — narrow the time window if you need complete mutation coverage.
+- **`event_name` and `read_only` filters are post-fetch (client-side):** For the service-scoped tables, the `EventSource` filter is the only server-side filter. Any `WHERE event_name` or `WHERE read_only` clause is applied locally after Coral retrieves results. The 500-event cap (10 pages × 50) may be reached on reads before the target mutations are fetched — narrow the time window if you need complete mutation coverage.
 - **Always supply explicit time filters:** Omitting `start_time` and `end_time` lets AWS choose the window, and that window is resolved independently on the initial request and on every NextToken page. This can cause `InvalidNextTokenException` or silently shift the result set mid-pagination. Use `CAST(EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours') AS BIGINT)` and pin both values.
 - **Time filters are Unix epoch seconds:** Convert with
   `CAST(EXTRACT(EPOCH FROM NOW() - INTERVAL '30 days') AS BIGINT)`.
 - **90-day retention:** LookupEvents only returns events from the last 90 days.
   For older data, query CloudTrail logs in S3 via Athena.
 - **`InvalidTimeRangeException`:** AWS returns HTTP 400 if `start_time` is after `end_time`, or if the timestamps are otherwise outside the range of values AWS accepts. A valid window that simply falls outside the 90-day retention period is **not** an error — it returns an empty result and ages out silently. Use rolling `NOW()`-relative expressions and keep `start_time` before `end_time`.
-- **Rate limit:** 2 requests per second per account per region. Queries that paginate
-  through many pages may hit this limit.
-- **5,000-event cap:** Pagination is capped at 100 pages × 50 results = 5,000 events per query.
-  For high-traffic accounts or wide time windows this limit can be hit silently — no error is
-  returned, results simply stop at 5,000. Narrow the time window (e.g. query day-by-day) to
-  stay under the cap.
+- **Rate limit (no auto-retry):** LookupEvents is limited to 2 requests per second
+  per account per region. CloudTrail returns `ThrottlingException` as an HTTP **400**
+  (not 429), and Coral's rate-limit retry path only triggers on 429, so a throttled
+  page surfaces as a hard query error rather than being retried. There is no
+  inter-request pacing between pages, so keep time windows narrow to avoid bursts.
+- **500-event cap:** Pagination is capped at 10 pages × 50 results = 500 events per query.
+  This deliberately low cap keeps a single scan well under the 2 req/s throttling limit.
+  If a query needs more than 500 events, Coral stops with a pagination error rather than
+  returning a partial result — narrow the time window (e.g. query day-by-day) and page
+  through smaller windows.
 - **Management events only:** LookupEvents covers management (control-plane) events only. Data events (S3 object reads/writes, Lambda invocations, DynamoDB item operations, etc.) and network activity events are not returned here. For data events, enable a Trail with the appropriate event selectors and query via S3 + Athena or CloudTrail Lake.
 - **CloudTrail must be enabled:** Most accounts have CloudTrail enabled by
   default. If not, events will be empty rather than returning an error.

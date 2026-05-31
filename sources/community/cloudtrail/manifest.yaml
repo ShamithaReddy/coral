@@ -65,8 +65,14 @@ request_headers:
     from: literal
     value: com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.LookupEvents
 test_queries:
-  - SELECT event_name, username, event_time FROM cloudtrail.management_events LIMIT 5
-  - SELECT event_name, resource_name, event_time FROM cloudtrail.lambda_events LIMIT 5
+  - >-
+    SELECT event_name, username, event_time FROM cloudtrail.management_events
+    WHERE start_time = CAST(EXTRACT(EPOCH FROM NOW() - INTERVAL '7 days') AS BIGINT)
+    AND end_time = CAST(EXTRACT(EPOCH FROM NOW()) AS BIGINT) LIMIT 5
+  - >-
+    SELECT event_name, resource_name, event_time FROM cloudtrail.ec2_events
+    WHERE start_time = CAST(EXTRACT(EPOCH FROM NOW() - INTERVAL '7 days') AS BIGINT)
+    AND end_time = CAST(EXTRACT(EPOCH FROM NOW()) AS BIGINT) LIMIT 5
 tables:
   - name: management_events
     description: >-
@@ -85,9 +91,11 @@ tables:
       omitting them causes the effective window to vary between the initial
       request and each NextToken page, which can invalidate pagination or
       silently shift the result window. Rate limit is 2 requests per second
-      per account per region. Queries are capped at 5,000 events (100 pages x
-      50 results); narrow the time window if your account exceeds this in the
-      requested period. Use json_get_json(cloudtrail_event,
+      per account per region, and CloudTrail returns ThrottlingException as
+      HTTP 400 (not 429), which Coral does not auto-retry. To stay well under
+      the limit, pagination is capped at 500 events (10 pages x 50 results);
+      narrow the time window (for example query day-by-day) if your account
+      exceeds this in the requested period. Use json_get_json(cloudtrail_event,
       'requestParameters') to inspect what changed.
     request:
       method: POST
@@ -114,7 +122,7 @@ tables:
       mode: cursor_body
       cursor_body_path: [NextToken]
       response_cursor_path: [NextToken]
-      max_pages: 100
+      max_pages: 10
     columns:
       - name: start_time
         type: Int64
@@ -206,9 +214,11 @@ tables:
       ReadOnly=false cannot be combined with the EventSource filter. The
       EventSource filter is applied server-side; any further filtering by
       event_name or read_only happens client-side after Coral receives the
-      results. In high-volume accounts the 5,000-event cap (100 pages x 50)
-      may be reached before all target mutations are fetched — narrow the time
-      window to stay under the cap. To restrict to write operations, add WHERE
+      results. The 500-event cap (10 pages x 50) may be reached before all
+      target mutations are fetched — narrow the time window to stay under the
+      cap. CloudTrail returns ThrottlingException as HTTP 400 (not 429), which
+      Coral does not auto-retry, so keep windows small. To restrict to write
+      operations, add WHERE
       event_name IN ('CreateFunction', 'UpdateFunctionCode',
       'UpdateFunctionConfiguration', 'DeleteFunction') or WHERE
       read_only = 'false' in your query. Use json_get_json(cloudtrail_event,
@@ -238,7 +248,7 @@ tables:
       mode: cursor_body
       cursor_body_path: [NextToken]
       response_cursor_path: [NextToken]
-      max_pages: 100
+      max_pages: 10
     columns:
       - name: start_time
         type: Int64
@@ -334,10 +344,12 @@ tables:
       accepts only one LookupAttribute per request, so ReadOnly=false cannot
       be combined with the EventSource filter. The EventSource filter is
       applied server-side; any further filtering by event_name or read_only
-      happens client-side after Coral receives the results. In high-volume
-      accounts the 5,000-event cap (100 pages x 50) may be reached before all
+      happens client-side after Coral receives the results. The 500-event cap
+      (10 pages x 50) may be reached before all
       target mutations are fetched — narrow the time window to stay under the
-      cap. To restrict to deployments, add WHERE event_name IN ('CreateStack',
+      cap. CloudTrail returns ThrottlingException as HTTP 400 (not 429), which
+      Coral does not auto-retry, so keep windows small. To restrict to
+      deployments, add WHERE event_name IN ('CreateStack',
       'UpdateStack', 'DeleteStack', 'ExecuteChangeSet') or WHERE
       read_only = 'false' in your query. Check
       json_get_str(cloudtrail_event, 'requestParameters', 'clientRequestToken')
@@ -368,7 +380,7 @@ tables:
       mode: cursor_body
       cursor_body_path: [NextToken]
       response_cursor_path: [NextToken]
-      max_pages: 100
+      max_pages: 10
     columns:
       - name: start_time
         type: Int64
@@ -465,9 +477,11 @@ tables:
       ReadOnly=false cannot be combined with the EventSource filter. The
       EventSource filter is applied server-side; any further filtering by
       event_name or read_only happens client-side after Coral receives the
-      results. In high-volume accounts the 5,000-event cap (100 pages x 50)
-      may be reached before all target mutations are fetched — narrow the time
-      window to stay under the cap. To restrict to instance lifecycle changes,
+      results. The 500-event cap (10 pages x 50) may be reached before all
+      target mutations are fetched — narrow the time window to stay under the
+      cap. CloudTrail returns ThrottlingException as HTTP 400 (not 429), which
+      Coral does not auto-retry, so keep windows small. To restrict to instance
+      lifecycle changes,
       add WHERE event_name IN ('RunInstances', 'TerminateInstances',
       'StartInstances', 'StopInstances', 'ModifyInstanceAttribute') or WHERE
       read_only = 'false' in your query. Only management (control-plane)
@@ -498,7 +512,7 @@ tables:
       mode: cursor_body
       cursor_body_path: [NextToken]
       response_cursor_path: [NextToken]
-      max_pages: 100
+      max_pages: 10
     columns:
       - name: start_time
         type: Int64
